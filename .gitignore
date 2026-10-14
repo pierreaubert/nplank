@@ -1,0 +1,5 @@
+/target/
+/.nplank/
+*.log
+*~
+

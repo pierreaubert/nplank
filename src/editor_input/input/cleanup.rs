@@ -1,0 +1,69 @@
+use super::EDIT_STATES;
+use super::FOCUS_HANDLES;
+use super::FOCUS_SUBS;
+use super::{INPUT_ENTITIES, TEXT_ORIGINS};
+use gpui::ElementId;
+
+/// Clean up thread-local state for an Input element.
+///
+/// Call this when removing an Input with a dynamic element ID to prevent
+/// memory leaks. For static element IDs, cleanup is not necessary.
+///
+/// # Example
+/// ```rust,ignore
+/// // When removing a dynamically-created Input
+/// cleanup_input_state(&ElementId::Name(format!("input-{}", item_id).into()));
+/// ```
+pub fn cleanup_input_state(id: &ElementId) {
+    FOCUS_HANDLES.with(|handles| {
+        handles.borrow_mut().remove(id);
+    });
+    EDIT_STATES.with(|states| {
+        states.borrow_mut().remove(id);
+    });
+    FOCUS_SUBS.with(|subs| {
+        subs.borrow_mut().remove(id);
+    });
+}
+
+/// Clean up thread-local state for Input elements whose IDs are not in the retained set.
+///
+/// This is useful for virtualized lists where you want to keep state only for
+/// currently visible items. Call this periodically or when the visible set changes.
+///
+/// # Example
+/// ```rust,ignore
+/// // Keep only the inputs currently in view
+/// let visible_ids: HashSet<ElementId> = visible_items
+///     .iter()
+///     .map(|item| ElementId::Name(format!("input-{}", item.id).into()))
+///     .collect();
+/// cleanup_stale_input_states(&visible_ids);
+/// ```
+pub fn cleanup_stale_input_states<S: std::hash::BuildHasher>(
+    retained_ids: &std::collections::HashSet<ElementId, S>,
+) {
+    FOCUS_HANDLES.with(|handles| {
+        handles
+            .borrow_mut()
+            .retain(|id, _| retained_ids.contains(id));
+    });
+    EDIT_STATES.with(|states| {
+        states
+            .borrow_mut()
+            .retain(|id, _| retained_ids.contains(id));
+    });
+    FOCUS_SUBS.with(|subs| {
+        subs.borrow_mut().retain(|id, _| retained_ids.contains(id));
+    });
+    TEXT_ORIGINS.with(|origins| {
+        origins
+            .borrow_mut()
+            .retain(|id, _| retained_ids.contains(id))
+    });
+    INPUT_ENTITIES.with(|entities| {
+        entities
+            .borrow_mut()
+            .retain(|id, _| retained_ids.contains(id))
+    });
+}
