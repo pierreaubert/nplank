@@ -33,6 +33,8 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:47831";
 /// Persistent daemon with one independent task per attached engine.
 #[derive(Debug)]
 pub struct Daemon {
+    pub(crate) notifications: Mutex<crate::notifications::Feed>,
+    pub(crate) views: Mutex<crate::focus::Views>,
     pub(crate) artifacts: Mutex<crate::artifacts::Artifacts>,
     pub(crate) telemetry: Mutex<HashMap<String, (u64, crate::model::EngineTelemetry)>>,
     pub(crate) processes: Mutex<HashMap<String, (u64, u32)>>,
@@ -64,6 +66,8 @@ impl Daemon {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let daemon = Arc::new(Self {
+            notifications: Mutex::default(),
+            views: Mutex::default(),
             artifacts: Mutex::new(crate::artifacts::Artifacts::new(staging)?),
             telemetry: Mutex::new(HashMap::new()),
             processes: Mutex::new(HashMap::new()),
@@ -82,13 +86,32 @@ impl Daemon {
     /// # Errors
     /// Returns storage errors.
     pub fn snapshot(&self, id: Option<&str>, before: i64) -> Result<Snapshot> {
-        let mut snapshot = self
-            .store
-            .lock()
-            .expect("store poisoned")
-            .snapshot(id, before)?;
+        self.snapshot_pages(id, before, 0)
+    }
+
+    /// Reads independent transcript and aside pages without changing execution.
+    ///
+    /// # Errors
+    /// Returns storage errors.
+    pub fn snapshot_pages(
+        &self,
+        id: Option<&str>,
+        before: i64,
+        aside_before: i64,
+    ) -> Result<Snapshot> {
+        let mut snapshot =
+            self.store
+                .lock()
+                .expect("store poisoned")
+                .snapshot_pages(id, before, aside_before)?;
         snapshot.providers = crate::agents::providers();
         snapshot.protocol_version = crate::model::PROTOCOL_VERSION;
+        snapshot.server_time_ms = crate::notifications::now_ms();
+        snapshot.notifications = self
+            .notifications
+            .lock()
+            .expect("notifications poisoned")
+            .snapshot(&snapshot.sessions, snapshot.server_time_ms);
         let telemetry = self.telemetry.lock().expect("telemetry poisoned");
         for session in &snapshot.sessions {
             if !session.recovery_required
@@ -96,9 +119,11 @@ impl Daemon {
                 && let Some((generation, counters)) = telemetry.get(&session.id)
                 && *generation == session.generation
             {
-                snapshot
-                    .telemetry
-                    .insert(session.id.clone(), counters.clone());
+                let mut counters = counters.clone();
+                if id != Some(session.id.as_str()) {
+                    counters.buddy = None;
+                }
+                snapshot.telemetry.insert(session.id.clone(), counters);
             }
         }
         drop(telemetry);
@@ -106,13 +131,11 @@ impl Daemon {
         // their small descriptors without resurrecting live engine status.
         let artifacts = self.artifacts.lock().expect("artifacts poisoned");
         for session in &snapshot.sessions {
-            for export in artifacts.metadata(&session.id, session.generation) {
+            let files = artifacts.metadata(&session.id, session.generation);
+            if !files.is_empty() {
                 let counters = snapshot.telemetry.entry(session.id.clone()).or_default();
-                if export.purpose == crate::model::ExportPurpose::Insights {
-                    counters.insights_export = Some(export);
-                } else {
-                    counters.export = Some(export);
-                }
+                counters
+                    .replace_artifacts(files, artifacts.retired(&session.id, session.generation));
             }
         }
         drop(artifacts);
@@ -135,6 +158,32 @@ impl Daemon {
         }
     }
 
+    /// Retires an intentionally closed local engine before accepting new input.
+    pub(crate) fn local_engine_exited(&self, session: &crate::model::Session) -> Result<()> {
+        let _command = self.commands.lock().expect("commands poisoned");
+        let mut active = self.workers.lock().expect("workers poisoned");
+        let store = self.store.lock().expect("store poisoned");
+        if store.session(&session.id)?.generation != session.generation {
+            return Ok(());
+        }
+        store.reset(&session.id)?;
+        let generation = store.session(&session.id)?.generation;
+        active.remove(&session.id);
+        self.telemetry
+            .lock()
+            .expect("telemetry poisoned")
+            .remove(&session.id);
+        self.contexts
+            .lock()
+            .expect("contexts poisoned")
+            .remove(&session.id);
+        self.artifacts
+            .lock()
+            .expect("artifacts poisoned")
+            .retain_generation(&session.id, generation);
+        Ok(())
+    }
+
     /// Applies a command, persisting prompts before execution begins.
     ///
     /// # Errors
@@ -142,6 +191,128 @@ impl Daemon {
     pub fn execute(self: &Arc<Self>, command: Command) -> Result<Receipt> {
         let _command = self.commands.lock().expect("commands poisoned");
         let id = match command {
+            Command::ViewFocus {
+                client_id,
+                session_id,
+                generation,
+            } => {
+                if let Some(id) = &session_id {
+                    let session = self.store.lock().expect("store poisoned").session(id)?;
+                    ensure!(
+                        session.generation == generation
+                            && !session.archived
+                            && !session.recovery_required
+                            && matches!(session.backend, Backend::Local { .. }),
+                        "Focus belongs to an inactive local session"
+                    );
+                }
+                self.views.lock().expect("view focus poisoned").update(
+                    &client_id,
+                    session_id.as_deref().map(|id| (id, generation)),
+                    std::time::Instant::now(),
+                )?;
+                session_id.unwrap_or_default()
+            }
+            Command::StopJobOutput {
+                session_id,
+                generation,
+                observer,
+            } => {
+                ensure!(
+                    crate::joboutput::valid_observer(&observer),
+                    "Invalid output observer"
+                );
+                let session = self
+                    .store
+                    .lock()
+                    .expect("store poisoned")
+                    .session(&session_id)?;
+                ensure!(
+                    session.generation == generation
+                        && !session.archived
+                        && !session.recovery_required,
+                    "Output belongs to an old engine generation"
+                );
+                ensure!(
+                    matches!(
+                        session.backend,
+                        Backend::Local { .. } | Backend::Remote { .. }
+                    ),
+                    "This backend has no output control channel"
+                );
+                ensure!(
+                    session.controls.as_ref().is_some_and(|controls| controls
+                        .features
+                        .iter()
+                        .any(|feature| feature.name == "job_output_cancel" && feature.available)),
+                    "Host requires queued /jobs unfollow"
+                );
+                self.ensure_remote_control(&session)?;
+                ensure!(
+                    workers::job_observer_current(self, &session, &observer)?,
+                    "Output observer is no longer live"
+                );
+                let workers = self.workers.lock().expect("workers poisoned");
+                workers
+                    .get(&session_id)
+                    .filter(|worker| !worker.task.is_finished())
+                    .context("Output engine disconnected")?
+                    .input
+                    .try_send(workers::Input::StopJobOutput(observer))
+                    .context("Output control queue is full; retry")?;
+                session_id
+            }
+            Command::FrameControl {
+                session_id,
+                generation,
+                request,
+            } => {
+                ensure!(request.is_valid(), "Invalid frame control");
+                let session = self
+                    .store
+                    .lock()
+                    .expect("store poisoned")
+                    .session(&session_id)?;
+                ensure!(
+                    session.generation == generation
+                        && !session.archived
+                        && !session.recovery_required,
+                    "Frame belongs to an old engine generation"
+                );
+                ensure!(
+                    matches!(
+                        session.backend,
+                        Backend::Local { .. } | Backend::Remote { .. }
+                    ),
+                    "This host does not support graphical frame input yet"
+                );
+                self.ensure_remote_control(&session)?;
+                ensure!(
+                    self.telemetry
+                        .lock()
+                        .expect("telemetry poisoned")
+                        .get(&session_id)
+                        .filter(|(owner, _)| *owner == generation)
+                        .and_then(|(_, telemetry)| telemetry.frame.as_ref())
+                        .is_some_and(|frame| frame.id == request.id),
+                    "Frame is no longer open"
+                );
+                let workers = self.workers.lock().expect("workers poisoned");
+                let worker = workers
+                    .get(&session_id)
+                    .filter(|worker| !worker.task.is_finished())
+                    .context("Frame engine disconnected")?;
+                worker
+                    .input
+                    .try_send(workers::Input::FrameControl(request))
+                    .context("Frame input queue is full; retry")?;
+                drop(workers);
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .acknowledge(&session_id)?;
+                session_id
+            }
             Command::ConnectRemote { session_id } => {
                 let session = self
                     .store
@@ -197,8 +368,15 @@ impl Daemon {
                     .filter(|(generation, _)| *generation == session.generation)
                     .and_then(|(_, telemetry)| telemetry.remote_access.as_ref())
                     .is_some_and(|access| access.waiting_input);
+                let frame_open = self
+                    .telemetry
+                    .lock()
+                    .expect("telemetry poisoned")
+                    .get(&session_id)
+                    .filter(|(generation, _)| *generation == session.generation)
+                    .is_some_and(|(_, telemetry)| telemetry.frame.is_some());
                 ensure!(
-                    !session.state.busy() || (request && waiting),
+                    !session.state.busy() || frame_open || (request && waiting),
                     "Finish or cancel input before changing control"
                 );
                 self.workers
@@ -314,12 +492,18 @@ impl Daemon {
                 text,
             } => {
                 ensure!(
-                    text.as_ref().is_none_or(|text| text.len() <= 256 * 1024),
+                    text.as_ref()
+                        .is_none_or(|text| text.len() <= crate::documenttransfer::DOCUMENT_BYTES),
                     "Document exceeds the editing limit"
                 );
                 let store = self.store.lock().expect("store poisoned");
                 let session = store.session(&session_id)?;
                 self.ensure_remote_control(&session)?;
+                ensure!(
+                    text.as_ref().is_none_or(|text| text.len()
+                        <= crate::commands::editor_save_limit(session.controls.as_ref())),
+                    "This engine does not support larger document Saves"
+                );
                 let editor = session
                     .approvals
                     .iter()
@@ -418,6 +602,81 @@ impl Daemon {
                 request_id,
                 text,
             } => {
+                let live_control =
+                    crate::livecontrol::LiveControl::parse(&text).filter(|control| {
+                        self.store
+                            .lock()
+                            .expect("store poisoned")
+                            .session(&session_id)
+                            .is_ok_and(|session| session.can_receive_live_control(*control))
+                    });
+                if let Some(control) = live_control {
+                    let session = self
+                        .store
+                        .lock()
+                        .expect("store poisoned")
+                        .session(&session_id)?;
+                    self.ensure_remote_control(&session)?;
+                    if self.store.lock().expect("store poisoned").aside_recorded(
+                        &session_id,
+                        &request_id,
+                        &text,
+                    )? {
+                        return Ok(Receipt { id: session_id });
+                    }
+                    let workers = self.workers.lock().expect("workers poisoned");
+                    let worker = workers
+                        .get(&session_id)
+                        .filter(|worker| !worker.task.is_finished())
+                        .context("Connect to the Plank engine before changing live settings")?;
+                    let permit = worker
+                        .input
+                        .try_reserve()
+                        .context("Plank cannot accept a live setting yet")?;
+                    if self
+                        .store
+                        .lock()
+                        .expect("store poisoned")
+                        .accept_live_control(&session_id, &request_id, &text)?
+                    {
+                        permit.send(workers::Input::LiveControl(control));
+                    }
+                    return Ok(Receipt { id: session_id });
+                }
+                let independent_aside = crate::commands::aside_question(&text).filter(|_| {
+                    self.store
+                        .lock()
+                        .expect("store poisoned")
+                        .session(&session_id)
+                        .is_ok_and(|session| session.can_receive_asides())
+                });
+                if let Some(question) = independent_aside {
+                    if self.store.lock().expect("store poisoned").aside_recorded(
+                        &session_id,
+                        &request_id,
+                        &text,
+                    )? {
+                        return Ok(Receipt { id: session_id });
+                    }
+                    let workers = self.workers.lock().expect("workers poisoned");
+                    let worker = workers
+                        .get(&session_id)
+                        .filter(|worker| !worker.task.is_finished())
+                        .context("Connect to the Plank engine before asking a side question")?;
+                    // Reserve capacity before committing the idempotent receipt.
+                    let permit = worker
+                        .input
+                        .try_reserve()
+                        .context("Plank cannot accept a side question yet")?;
+                    if self.store.lock().expect("store poisoned").accept_aside(
+                        &session_id,
+                        &request_id,
+                        &text,
+                    )? {
+                        permit.send(workers::Input::Aside(question.into()));
+                    }
+                    return Ok(Receipt { id: session_id });
+                }
                 let accepted = self.store.lock().expect("store poisoned").accept_prompt(
                     &session_id,
                     &request_id,
@@ -512,11 +771,287 @@ impl Daemon {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_live_settings_require_control_before_recording_the_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let daemon = Daemon::open(&directory.path().join("state.sqlite"), "secret".into())?;
+        let session = {
+            let store = daemon.store.lock().expect("store poisoned");
+            let workspace = store.create_workspace("Remote", directory.path().to_str().unwrap())?;
+            let id = store.create_session(
+                &workspace,
+                "Agent",
+                Backend::Remote {
+                    url: "ws://127.0.0.1:9100".into(),
+                    token_env: "UNUSED".into(),
+                },
+            )?;
+            store.set_state(&id, RunState::Running, false)?;
+            let session = store.session(&id)?;
+            store.controls(&id, session.generation, serde_json::from_value(serde_json::json!({"version":1,"commands":[],"features":[{"name":"remote_live_controls","label":"Live settings","available":true,"detail":"Independent settings"}]}))?)?;
+            store.session(&id)?
+        };
+        let (input, mut receiver) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        daemon
+            .workers
+            .lock()
+            .expect("workers poisoned")
+            .insert(session.id.clone(), Worker { input, task });
+        let command = || Command::Prompt {
+            session_id: session.id.clone(),
+            request_id: "remote-setting".into(),
+            text: "/mc off".into(),
+        };
+        assert!(daemon.execute(command()).is_err());
+        assert!(!daemon.store.lock().unwrap().aside_recorded(
+            &session.id,
+            "remote-setting",
+            "/mc off"
+        )?);
+        let access = crate::model::RemoteAccess {
+            client_id: Some(7),
+            controller: true,
+            requesting: false,
+            waiting_input: false,
+            reason: None,
+        };
+        daemon.telemetry.lock().unwrap().insert(
+            session.id.clone(),
+            (
+                session.generation + 1,
+                crate::model::EngineTelemetry {
+                    remote_access: Some(access.clone()),
+                    ..Default::default()
+                },
+            ),
+        );
+        assert!(
+            daemon.execute(command()).is_err(),
+            "Stale grants cannot authorize new settings"
+        );
+        daemon.telemetry.lock().unwrap().insert(
+            session.id.clone(),
+            (
+                session.generation,
+                crate::model::EngineTelemetry {
+                    remote_access: Some(access),
+                    ..Default::default()
+                },
+            ),
+        );
+        daemon.execute(command())?;
+        assert!(matches!(
+            receiver.try_recv()?,
+            workers::Input::LiveControl(crate::livecontrol::LiveControl::MicroCompaction(false))
+        ));
+        daemon.execute(Command::Reset {
+            session_id: session.id,
+        })?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_settings_preserve_turns_and_retry_refused_requests() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let daemon = Daemon::open(&directory.path().join("state.sqlite"), "secret".into())?;
+        let id = {
+            let store = daemon.store.lock().expect("store poisoned");
+            let workspace = store.create_workspace("Local", directory.path().to_str().unwrap())?;
+            let id = store.create_session(
+                &workspace,
+                "Agent",
+                Backend::Local {
+                    executable: "unused".into(),
+                    args: vec![],
+                },
+            )?;
+            store.set_state(&id, RunState::Running, false)?;
+            store.append(&id, "user", "Main task")?;
+            id
+        };
+        let command = |request: &str, text: &str| Command::Prompt {
+            session_id: id.clone(),
+            request_id: request.into(),
+            text: text.into(),
+        };
+        // An older engine must not bypass ordinary busy-turn validation.
+        assert!(daemon.execute(command("old", "/mc off")).is_err());
+        let controls = serde_json::from_value(
+            serde_json::json!({"version":1,"commands":[],"features":[{"name":"console_live_controls","label":"Live settings","available":true,"detail":"Independent settings"}]}),
+        )?;
+        let session = {
+            let store = daemon.store.lock().expect("store poisoned");
+            let session = store.session(&id)?;
+            store.controls(&id, session.generation, controls)?;
+            store.session(&id)?
+        };
+        let mut remote = session.clone();
+        remote.backend = Backend::Remote {
+            url: "ws://unused".into(),
+            token_env: "UNUSED".into(),
+        };
+        assert!(
+            !remote.can_receive_live_controls(),
+            "A local capability must not enable unsupported remote input"
+        );
+        let (input, mut receiver) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        daemon
+            .workers
+            .lock()
+            .expect("workers poisoned")
+            .insert(id.clone(), Worker { input, task });
+        let before = daemon.snapshot(Some(&id), 0)?;
+        daemon.execute(command("mc", "/mc off"))?;
+        daemon.execute(command("mc", "/mc off"))?;
+        assert!(daemon.execute(command("mc", "/mc on")).is_err());
+        assert!(daemon.execute(command("lg", "/loopguard off")).is_err());
+        assert!(matches!(
+            receiver.try_recv()?,
+            workers::Input::LiveControl(crate::livecontrol::LiveControl::MicroCompaction(false))
+        ));
+        daemon.execute(command("lg", "/loopguard off"))?;
+        assert!(matches!(
+            receiver.try_recv()?,
+            workers::Input::LiveControl(crate::livecontrol::LiveControl::LoopGuard(false))
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(!session.can_receive_live_control(crate::livecontrol::LiveControl::Hints(true)));
+        assert!(daemon.execute(command("hints", "/hints on")).is_err());
+        {
+            let store = daemon.store.lock().expect("store poisoned");
+            let mut controls = session.controls.clone().unwrap();
+            controls.features.push(crate::commands::EngineFeature {
+                name: "live_hints".into(),
+                label: "Hints".into(),
+                available: true,
+                detail: "Mid-turn hints".into(),
+            });
+            store.controls(&id, session.generation, controls)?;
+        }
+        daemon.execute(command("hints", "/hints on"))?;
+        daemon.execute(command("hints", "/hints on"))?;
+        assert!(matches!(
+            receiver.try_recv()?,
+            workers::Input::LiveControl(crate::livecontrol::LiveControl::Hints(true))
+        ));
+        assert!(receiver.try_recv().is_err());
+        let notification =
+            crate::livecontrol::LiveControl::Notifications(crate::livecontrol::NotifyMode::Never);
+        assert!(!daemon.snapshot(Some(&id), 0)?.sessions[0].can_receive_live_control(notification));
+        assert!(daemon.execute(command("notify", "/notify never")).is_err());
+        {
+            let store = daemon.store.lock().expect("store poisoned");
+            let mut controls = store.session(&id)?.controls.unwrap();
+            controls.features.push(crate::commands::EngineFeature {
+                name: "live_notify".into(),
+                label: "Notify".into(),
+                available: true,
+                detail: "Independent policy".into(),
+            });
+            store.controls(&id, session.generation, controls)?;
+        }
+        daemon.execute(command("notify", "/notify never"))?;
+        daemon.execute(command("notify", "/notify never"))?;
+        assert!(
+            matches!(receiver.try_recv()?, workers::Input::LiveControl(control) if control == notification)
+        );
+        assert!(receiver.try_recv().is_err());
+        let after = daemon.snapshot(Some(&id), 0)?;
+        assert_eq!(before.entries, after.entries);
+        assert_eq!(after.sessions[0].state, RunState::Running);
+        assert_eq!(after.sessions[0].generation, session.generation);
+        daemon.execute(Command::Reset {
+            session_id: id.clone(),
+        })?;
+        assert!(!daemon.snapshot(Some(&id), 0)?.sessions[0].can_receive_live_controls());
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_asides_preserve_active_turns_deduplicate_and_retry_queue_refusals() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let daemon = Daemon::open(&directory.path().join("state.sqlite"), "secret".into())?;
+        let id = {
+            let store = daemon.store.lock().expect("store poisoned");
+            let workspace = store.create_workspace("Remote", directory.path().to_str().unwrap())?;
+            let id = store.create_session(
+                &workspace,
+                "Agent",
+                Backend::Remote {
+                    url: "ws://127.0.0.1:9100".into(),
+                    token_env: "UNUSED_FIXTURE_TOKEN".into(),
+                },
+            )?;
+            store.set_state(&id, RunState::Running, false)?;
+            store.append(&id, "user", "Main task")?;
+            id
+        };
+        let (input, mut receiver) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        daemon
+            .workers
+            .lock()
+            .expect("workers poisoned")
+            .insert(id.clone(), Worker { input, task });
+        let before = daemon.snapshot(Some(&id), 0)?;
+        let command = |request: &str, text: &str| Command::Prompt {
+            session_id: id.clone(),
+            request_id: request.into(),
+            text: text.into(),
+        };
+        // No controller grant is needed: Plank allows observers to ask asides.
+        daemon.execute(command("side-1", "/btw Why?"))?;
+        daemon.execute(command("side-1", "/btw Why?"))?;
+        assert!(
+            daemon
+                .execute(command("main-2", "Another main task"))
+                .is_err()
+        );
+        assert!(
+            daemon
+                .execute(command("invalid-side", "/btwfoo Why?"))
+                .is_err()
+        );
+        assert!(daemon.execute(command("side-1", "/btw Different")).is_err());
+        // The queue is full; a refused question must remain retryable.
+        assert!(daemon.execute(command("side-2", "/btw Next?")).is_err());
+        assert!(matches!(receiver.try_recv()?, workers::Input::Aside(text) if text == "Why?"));
+        daemon.execute(command("side-2", "/btw Next?"))?;
+        assert!(matches!(receiver.try_recv()?, workers::Input::Aside(text) if text == "Next?"));
+        assert!(receiver.try_recv().is_err());
+        let after = daemon.snapshot(Some(&id), 0)?;
+        assert_eq!(after.entries, before.entries);
+        assert!(after.asides.is_empty());
+        assert_eq!(after.sessions[0].state, RunState::Running);
+        assert_eq!(after.sessions[0].generation, before.sessions[0].generation);
+        daemon.execute(Command::Reset {
+            session_id: id.clone(),
+        })?;
+        assert!(
+            daemon
+                .execute(command("side-3", "/btw After reset?"))
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct SnapshotQuery {
     session: Option<String>,
     #[serde(default)]
     before: i64,
+    #[serde(default)]
+    aside_before: i64,
 }
 
 #[derive(Debug)]
@@ -549,7 +1084,7 @@ async fn snapshot(
 ) -> std::result::Result<Json<Snapshot>, ApiError> {
     authorize(&daemon, &headers)?;
     daemon
-        .snapshot(query.session.as_deref(), query.before)
+        .snapshot_pages(query.session.as_deref(), query.before, query.aside_before)
         .map(Json)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -564,6 +1099,171 @@ async fn command(
         .execute(command)
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorReadQuery {
+    session: String,
+    document: String,
+    requirement: String,
+    offset: usize,
+}
+
+async fn editor_read(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Query(query): Query<EditorReadQuery>,
+) -> std::result::Result<Response, ApiError> {
+    authorize(&daemon, &headers)?;
+    if query.session.len() > 256 || query.document.len() > 256 || query.requirement.len() > 8192 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid editor metadata".into(),
+        ));
+    }
+    let requirement = serde_json::from_str(&query.requirement)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Invalid editor requirement".into()))?;
+    let bytes = daemon
+        .store
+        .lock()
+        .expect("store poisoned")
+        .document_chunk(&query.session, &query.document, &requirement, query.offset)
+        .map_err(|error| ApiError(StatusCode::CONFLICT, error.to_string()))?;
+    let length = bytes.len();
+    let mut response = (
+        [
+            ("content-type", "application/octet-stream"),
+            ("cache-control", "no-store"),
+            ("x-content-type-options", "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "content-length",
+        length.to_string().parse().expect("numeric header"),
+    );
+    Ok(response)
+}
+
+// Bound collection even before loading the engine's smaller legacy Save limit.
+const EDITOR_UPLOAD_BYTES: usize = crate::documenttransfer::DOCUMENT_BYTES;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorUploadQuery {
+    session: String,
+    document: String,
+    requirement: String,
+    bytes: usize,
+    sha256: String,
+}
+
+async fn editor_upload(
+    State(daemon): State<Arc<Daemon>>,
+    Query(query): Query<EditorUploadQuery>,
+    request: axum::extract::Request,
+) -> std::result::Result<Json<Receipt>, ApiError> {
+    authorize(&daemon, request.headers())?;
+    if query.bytes > EDITOR_UPLOAD_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Document exceeds the editing limit".into(),
+        ));
+    }
+    if query.session.len() > 256 || query.document.len() > 256 || query.requirement.len() > 8192 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid editor upload metadata".into(),
+        ));
+    }
+    if query.sha256.len() != 64
+        || !query
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid editor upload checksum".into(),
+        ));
+    }
+    if !request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/plain"))
+        })
+    {
+        return Err(ApiError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Editor uploads require UTF-8 text/plain".into(),
+        ));
+    }
+    let requirement: serde_json::Value = serde_json::from_str(&query.requirement)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "Invalid editor requirement".into()))?;
+    // Refuse stale or unauthorized requests before reading their bodies.
+    {
+        let store = daemon.store.lock().expect("store poisoned");
+        let session = store
+            .session(&query.session)
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+        daemon
+            .ensure_remote_control(&session)
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+        if !session.approvals.iter().any(|editor| {
+            editor.id == query.document
+                && editor.requirement["kind"] == "plank_editor"
+                && editor.requirement == requirement
+        }) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Editor changed; reopen before saving".into(),
+            ));
+        }
+        if query.bytes > crate::commands::editor_save_limit(session.controls.as_ref()) {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "This engine does not support larger document Saves".into(),
+            ));
+        }
+    }
+    let body = axum::body::to_bytes(request.into_body(), query.bytes)
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Editor upload exceeds its limit or could not be read".into(),
+            )
+        })?;
+    if body.len() != query.bytes || crate::documenttransfer::digest(&body) != query.sha256 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Document upload is incomplete or corrupt".into(),
+        ));
+    }
+    let text = String::from_utf8(body.to_vec()).map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "Editor uploads must contain valid UTF-8".into(),
+        )
+    })?;
+    // execute checks the same complete requirement again after collection,
+    // including any generation, dialog or controller change during the upload.
+    daemon
+        .execute(Command::EditDocument {
+            session_id: query.session,
+            approval_id: query.document,
+            requirement,
+            text: Some(text),
+        })
+        .map(Json)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,6 +1349,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     Router::new()
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/command", post(command))
+        .route("/v1/editor", get(editor_read).post(editor_upload))
         .route("/v1/export", get(export_file))
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024))
         .with_state(daemon)

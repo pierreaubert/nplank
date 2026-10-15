@@ -31,7 +31,7 @@ impl Store {
         let db = Connection::open(path)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 2,
+            version <= 3,
             "Database was created by a newer nplank version"
         );
         db.execute_batch(
@@ -43,7 +43,12 @@ impl Store {
              CREATE INDEX IF NOT EXISTS entries_session ON entries(session_id, sequence);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, text TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS remote_seen(session_id TEXT NOT NULL, id INTEGER NOT NULL,
-                 PRIMARY KEY(session_id, id));",
+                 PRIMARY KEY(session_id, id));
+             CREATE TABLE IF NOT EXISTS remote_hosts(session_id TEXT PRIMARY KEY, instance TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS editor_documents(session_id TEXT NOT NULL, approval_id TEXT NOT NULL,
+                 requirement TEXT NOT NULL, PRIMARY KEY(session_id, approval_id));
+             CREATE TABLE IF NOT EXISTS editor_document_chunks(session_id TEXT NOT NULL, approval_id TEXT NOT NULL,
+                 offset INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(session_id, approval_id, offset));",
         )?;
         let store = Self { db };
         let mut statement = store
@@ -53,16 +58,42 @@ impl Store {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         drop(statement);
+        let migration = store.db.unchecked_transaction()?;
         for (id, data, rowid) in rows {
             let value: serde_json::Value = serde_json::from_str(&data)?;
-            if value.get("position").is_none() {
-                let mut session: Session = serde_json::from_value(value)?;
+            let missing_position = value.get("position").is_none();
+            let mut session: Session = serde_json::from_value(value)?;
+            let mut modified = missing_position;
+            if missing_position {
                 session.position = rowid;
+            }
+            for approval in &mut session.approvals {
+                if approval.requirement["kind"] == "plank_editor" && approval.document.is_none() {
+                    store.stage_document(&id, approval)?;
+                    modified = true;
+                }
+            }
+            if modified {
                 store
                     .save_session(&session)
                     .with_context(|| format!("Cannot migrate session {id}"))?;
             }
         }
+        // Finish cleanup after a prior crash between metadata retirement and
+        // chunk deletion; unreferenced originals must not accumulate forever.
+        store.db.execute_batch(
+            "DELETE FROM editor_documents WHERE NOT EXISTS (
+                SELECT 1 FROM sessions, json_each(sessions.data,'$.approvals') AS approval
+                WHERE sessions.id=editor_documents.session_id
+                  AND json_extract(approval.value,'$.id')=editor_documents.approval_id
+                  AND json_extract(approval.value,'$.document') IS NOT NULL);
+             DELETE FROM editor_document_chunks WHERE NOT EXISTS (
+                SELECT 1 FROM editor_documents
+                WHERE editor_documents.session_id=editor_document_chunks.session_id
+                  AND editor_documents.approval_id=editor_document_chunks.approval_id);",
+        )?;
+        store.check_version()?;
+        migration.commit()?;
         Ok(store)
     }
 
@@ -221,11 +252,120 @@ impl Store {
     }
 
     fn save_session(&self, session: &Session) -> Result<()> {
+        let data = serde_json::to_string(session)?;
         self.db.execute(
             "UPDATE sessions SET data=?2 WHERE id=?1",
-            params![session.id, serde_json::to_string(session)?],
+            params![session.id, data],
+        )?;
+        self.db.execute(
+            "DELETE FROM editor_documents WHERE session_id=?1 AND approval_id NOT IN (
+                SELECT json_extract(value,'$.id') FROM json_each(?2,'$.approvals')
+                WHERE json_extract(value,'$.document') IS NOT NULL)",
+            params![session.id, data],
+        )?;
+        self.db.execute(
+            "DELETE FROM editor_document_chunks WHERE session_id=?1 AND approval_id NOT IN (
+                SELECT approval_id FROM editor_documents WHERE session_id=?1)",
+            [&session.id],
         )?;
         Ok(())
+    }
+
+    fn stage_document(
+        &self,
+        session_id: &str,
+        approval: &mut crate::model::PendingApproval,
+    ) -> Result<()> {
+        ensure!(
+            approval.arguments.len() <= crate::documenttransfer::DOCUMENT_BYTES,
+            "Document exceeds the editing limit"
+        );
+        approval.document = Some(crate::model::EditorDocument {
+            bytes: approval.arguments.len(),
+            sha256: crate::documenttransfer::digest(approval.arguments.as_bytes()),
+        });
+        self.db.execute(
+            "INSERT OR REPLACE INTO editor_documents VALUES(?1,?2,?3)",
+            params![
+                session_id,
+                approval.id,
+                serde_json::to_string(&approval.requirement)?
+            ],
+        )?;
+        self.db.execute(
+            "DELETE FROM editor_document_chunks WHERE session_id=?1 AND approval_id=?2",
+            params![session_id, approval.id],
+        )?;
+        let mut insert = self
+            .db
+            .prepare("INSERT INTO editor_document_chunks VALUES(?1,?2,?3,?4)")?;
+        for (index, bytes) in approval
+            .arguments
+            .as_bytes()
+            .chunks(crate::model::EDITOR_FETCH_BYTES)
+            .enumerate()
+        {
+            insert.execute(params![
+                session_id,
+                approval.id,
+                i64::try_from(index * crate::model::EDITOR_FETCH_BYTES)?,
+                bytes
+            ])?;
+        }
+        approval.arguments.clear();
+        Ok(())
+    }
+
+    /// Reads one bounded original-document chunk for the current editor requirement.
+    ///
+    /// # Errors
+    /// Returns stale-revision, missing-document, size, or database errors.
+    pub fn document_chunk(
+        &self,
+        session_id: &str,
+        approval_id: &str,
+        requirement: &serde_json::Value,
+        offset: usize,
+    ) -> Result<Vec<u8>> {
+        let session = self.session(session_id)?;
+        let editor = session
+            .approvals
+            .iter()
+            .find(|editor| {
+                editor.id == approval_id
+                    && editor.requirement == *requirement
+                    && editor.requirement["kind"] == "plank_editor"
+            })
+            .context("Editor changed; reopen before loading")?;
+        let document = editor
+            .document
+            .as_ref()
+            .context("Document metadata is unavailable")?;
+        ensure!(
+            document.bytes <= crate::documenttransfer::DOCUMENT_BYTES,
+            "Document exceeds the editing limit"
+        );
+        ensure!(
+            offset <= document.bytes && offset.is_multiple_of(crate::model::EDITOR_FETCH_BYTES),
+            "Invalid document chunk offset"
+        );
+        let current: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM editor_documents WHERE session_id=?1 AND approval_id=?2 AND requirement=?3)",
+            params![session_id, approval_id, serde_json::to_string(requirement)?], |row| row.get(0),
+        )?;
+        ensure!(current, "Original document is no longer available");
+        if offset == document.bytes {
+            return Ok(Vec::new());
+        }
+        let bytes: Vec<u8> = self.db.query_row(
+            "SELECT bytes FROM editor_document_chunks WHERE session_id=?1 AND approval_id=?2 AND offset=?3",
+            params![session_id, approval_id, i64::try_from(offset)?], |row| row.get(0),
+        )?;
+        ensure!(
+            bytes.len() == (document.bytes - offset).min(crate::model::EDITOR_FETCH_BYTES),
+            "Original document length changed"
+        );
+        Ok(bytes)
     }
 
     /// Changes the session's execution state.
@@ -361,6 +501,13 @@ impl Store {
         controls: crate::commands::EngineControls,
     ) -> Result<()> {
         ensure!(controls.version == 1, "Unsupported engine control protocol");
+        ensure!(
+            controls
+                .suggestion
+                .as_ref()
+                .is_none_or(crate::commands::PromptSuggestion::is_valid),
+            "Invalid prompt suggestion"
+        );
         ensure!(controls.features.len() <= 64, "Too many engine features");
         let mut features = std::collections::HashSet::new();
         for feature in &controls.features {
@@ -392,7 +539,13 @@ impl Store {
         );
         for command in &controls.commands {
             ensure!(
-                command.name.starts_with('/')
+                (command.name.starts_with('/')
+                    || (matches!(command.name.as_str(), "!" | "!!")
+                        && command.source == "builtin"
+                        && controls
+                            .features
+                            .iter()
+                            .any(|feature| feature.name == "shell_escapes" && feature.available)))
                     && command.name.len() <= 256
                     && !command.name.contains(char::is_whitespace)
                     && !command.name.contains(char::is_control)
@@ -441,13 +594,23 @@ impl Store {
         &self,
         id: &str,
         generation: u64,
-        approval: crate::model::PendingApproval,
+        mut approval: crate::model::PendingApproval,
     ) -> Result<()> {
         let mut session = self.session(id)?;
         ensure!(session.generation == generation, "Worker was replaced");
+        let transaction = self.db.unchecked_transaction()?;
+        if approval.requirement["kind"] == "plank_editor" {
+            ensure!(
+                approval.document.is_none(),
+                "Document metadata is daemon-owned"
+            );
+            self.stage_document(id, &mut approval)?;
+        }
         session.approvals.retain(|a| a.id != approval.id);
         session.approvals.push(approval);
-        self.save_session(&session)
+        self.save_session(&session)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Removes a provider-resolved approval from the current session.
@@ -537,6 +700,90 @@ impl Store {
         Ok(true)
     }
 
+    /// Records an ephemeral Plank question without changing the main turn.
+    ///
+    /// # Errors
+    /// Returns validation, recovery, or database errors.
+    pub fn accept_aside(&self, id: &str, request_id: &str, text: &str) -> Result<bool> {
+        ensure!(
+            crate::commands::aside_question(text).is_some(),
+            "A side question is required"
+        );
+        ensure!(text.len() <= 64 * 1024, "Side question exceeds 64 KiB");
+        ensure!(!request_id.is_empty(), "Request identifier is required");
+        if self.aside_recorded(id, request_id, text)? {
+            return Ok(false);
+        }
+        let session = self.session(id)?;
+        ensure!(
+            session.can_receive_asides(),
+            "This Plank engine does not advertise independent side-question input"
+        );
+        ensure!(
+            !session.archived && !session.recovery_required,
+            "Restore the session's context before asking a side question"
+        );
+        self.db.execute(
+            "INSERT INTO requests VALUES(?1,?2,?3)",
+            params![request_id, id, text],
+        )?;
+        Ok(true)
+    }
+
+    /// Records an independent setting change without altering the main turn.
+    ///
+    /// # Errors
+    /// Returns validation, recovery, or database errors.
+    pub(crate) fn accept_live_control(
+        &self,
+        id: &str,
+        request_id: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let control = crate::livecontrol::LiveControl::parse(text)
+            .context("An explicit live control is required")?;
+        ensure!(
+            text.len() <= 64 * 1024 && !request_id.is_empty(),
+            "Invalid live control request"
+        );
+        if self.aside_recorded(id, request_id, text)? {
+            return Ok(false);
+        }
+        let session = self.session(id)?;
+        ensure!(
+            session.can_receive_live_control(control),
+            "This engine does not advertise independent setting input"
+        );
+        ensure!(
+            !session.archived && !session.recovery_required,
+            "Restore the session before changing settings"
+        );
+        self.db.execute(
+            "INSERT INTO requests VALUES(?1,?2,?3)",
+            params![request_id, id, text],
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn aside_recorded(&self, id: &str, request_id: &str, text: &str) -> Result<bool> {
+        let existing: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT session_id,text FROM requests WHERE id=?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((old_id, old_text)) = existing {
+            ensure!(
+                old_id == id && old_text == text,
+                "Request identifier was reused with different content"
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Appends one transcript chunk with a monotonic sequence.
     ///
     /// # Errors
@@ -548,6 +795,93 @@ impl Store {
             params![id, role, text],
         )?;
         Ok(())
+    }
+
+    /// Binds replay IDs to an authenticated server instance for this worker.
+    ///
+    /// Missing identities retain legacy replay behavior. A changed identity retires
+    /// seen IDs and host-owned controls/dialogs while preserving transcript and receipts.
+    ///
+    /// # Errors
+    /// Returns identity, backend, generation, database, or decoding errors.
+    pub fn bind_remote_instance(
+        &mut self,
+        id: &str,
+        generation: u64,
+        instance: Option<&str>,
+    ) -> Result<bool> {
+        if let Some(instance) = instance {
+            ensure!(
+                !instance.is_empty()
+                    && instance.len() <= 128
+                    && instance
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+                "Invalid remote server instance identity"
+            );
+        }
+        let mut session = self.session(id)?;
+        ensure!(
+            matches!(session.backend, Backend::Remote { .. }),
+            "Only remote sessions have server instances"
+        );
+        ensure!(
+            session.generation == generation,
+            "Remote worker was replaced before authentication completed"
+        );
+        let prior: Option<String> = self
+            .db
+            .query_row(
+                "SELECT instance FROM remote_hosts WHERE session_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next = instance.unwrap_or_default();
+        let seen: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_seen WHERE session_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        let changed = prior.as_deref().map_or_else(
+            || {
+                instance.is_some()
+                    && (seen || session.controls.is_some() || !session.approvals.is_empty())
+            },
+            |prior| prior != next,
+        );
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO remote_hosts(session_id,instance) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET instance=excluded.instance", params![id,next])?;
+        if changed {
+            tx.execute("DELETE FROM remote_seen WHERE session_id=?1", [id])?;
+            session.controls = None;
+            session.approvals.clear();
+            session.progress = None;
+            session.attention = true;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![id, serde_json::to_string(&session)?],
+            )?;
+            tx.execute("INSERT INTO entries(session_id,role,text) VALUES(?1,'system',?2)", params![id,"Remote Plank server instance changed; earlier entries are retained for reference."])?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Records an ephemeral remote event without creating a transcript entry.
+    pub(crate) fn record_remote_event(
+        &self,
+        id: &str,
+        generation: u64,
+        sequence: i64,
+    ) -> Result<bool> {
+        if sequence < 0 || self.session(id)?.generation != generation {
+            return Ok(false);
+        }
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO remote_seen VALUES(?1,?2)",
+            params![id, sequence],
+        )? != 0)
     }
 
     /// Appends a remote chunk once, including reconnect snapshot replay.
@@ -568,6 +902,51 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Retires conversation-scoped controls once for a live engine reset.
+    ///
+    /// # Errors
+    /// Returns storage or serialization errors; stale and replayed resets return false.
+    pub(crate) fn conversation_replaced(
+        &mut self,
+        id: &str,
+        generation: u64,
+        sequence: Option<i64>,
+    ) -> Result<bool> {
+        let mut session = self.session(id)?;
+        if session.generation != generation {
+            return Ok(false);
+        }
+        let tx = self.db.transaction()?;
+        if let Some(sequence) = sequence
+            && tx.execute(
+                "INSERT OR IGNORE INTO remote_seen VALUES(?1,?2)",
+                params![id, sequence],
+            )? == 0
+        {
+            return Ok(false);
+        }
+        session.approvals.clear();
+        session.progress = None;
+        session.agent_session = None;
+        session.resumable = false;
+        if let Some(controls) = &mut session.controls {
+            controls.suggestion = None;
+        }
+        tx.execute(
+            "UPDATE sessions SET data=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&session)?],
+        )?;
+        tx.execute(
+            "INSERT INTO entries(session_id,role,text) VALUES(?1,'context_boundary',?2)",
+            params![
+                id,
+                "Plank replaced its conversation; earlier messages are retained for reference."
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Marks surviving engine contexts as lost after a daemon restart.
@@ -603,7 +982,7 @@ impl Store {
             .execute("DELETE FROM remote_seen WHERE session_id=?1", [id])?;
         self.append(
             id,
-            "system",
+            "context_boundary",
             "A fresh engine context starts here; earlier messages are retained for reference.",
         )
     }
@@ -631,6 +1010,19 @@ impl Store {
     /// # Errors
     /// Returns database or serialization errors.
     pub fn snapshot(&self, session_id: Option<&str>, before: i64) -> Result<Snapshot> {
+        self.snapshot_pages(session_id, before, 0)
+    }
+
+    /// Reads transcript and aside pages with independent cursors.
+    ///
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub fn snapshot_pages(
+        &self,
+        session_id: Option<&str>,
+        before: i64,
+        aside_before: i64,
+    ) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         for (table, workspaces) in [("workspaces", true), ("sessions", false)] {
             let mut statement = self
@@ -647,22 +1039,32 @@ impl Store {
             }
         }
         if let Some(id) = session_id {
-            let mut statement = self.db.prepare(
-                "SELECT sequence,session_id,role,text FROM entries WHERE session_id=?1 AND (?2=0 OR sequence<?2)
-                 ORDER BY sequence DESC LIMIT 250",
-            )?;
-            let rows = statement.query_map(params![id, before], |r| {
-                Ok(Entry {
-                    sequence: r.get(0)?,
-                    session_id: r.get(1)?,
-                    role: r.get(2)?,
-                    text: r.get(3)?,
-                })
-            })?;
-            for row in rows {
-                snapshot.entries.push(row?);
+            for (side, cursor) in [(false, before), (true, aside_before)] {
+                let sql = if side {
+                    "SELECT sequence,session_id,role,text FROM entries WHERE session_id=?1 AND role IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2) ORDER BY sequence DESC LIMIT 250"
+                } else {
+                    "SELECT sequence,session_id,role,text FROM entries WHERE session_id=?1 AND role NOT IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2)
+                 ORDER BY sequence DESC LIMIT 250"
+                };
+                let mut statement = self.db.prepare(sql)?;
+                let rows = statement.query_map(params![id, cursor], |r| {
+                    Ok(Entry {
+                        sequence: r.get(0)?,
+                        session_id: r.get(1)?,
+                        role: r.get(2)?,
+                        text: r.get(3)?,
+                    })
+                })?;
+                for row in rows {
+                    if side {
+                        snapshot.asides.push(row?);
+                    } else {
+                        snapshot.entries.push(row?);
+                    }
+                }
             }
             snapshot.entries.reverse();
+            snapshot.asides.reverse();
         }
         snapshot.sessions.sort_by_key(|session| session.position);
         for session in &mut snapshot.sessions {
@@ -685,14 +1087,27 @@ impl Store {
         Ok(snapshot)
     }
 
+    /// Marks a newly opened interactive surface as needing attention.
+    ///
+    /// # Errors
+    /// Returns storage or unknown-session errors.
+    pub fn request_attention(&self, id: &str) -> Result<()> {
+        let mut session = self.session(id)?;
+        session.attention = true;
+        self.save_session(&session)
+    }
+
     /// Clears completion attention without dismissing pending approvals.
     ///
     /// # Errors
     /// Returns storage or unknown-session errors.
     pub fn acknowledge(&self, id: &str) -> Result<()> {
         let mut session = self.session(id)?;
-        session.attention = false;
-        self.save_session(&session)
+        if session.attention {
+            session.attention = false;
+            self.save_session(&session)?;
+        }
+        Ok(())
     }
 
     /// Updates bounded engine progress only for the current worker generation.
@@ -717,7 +1132,7 @@ impl Store {
         self.save_session(&session)
     }
 
-    /// Marks a same-process restart while retaining the accepted command and transcript.
+    /// Marks an expected engine restart while retaining accepted input and history.
     ///
     /// # Errors
     /// Returns generation or persistence errors.
@@ -769,10 +1184,10 @@ impl Store {
     /// Returns an error if a future schema is encountered.
     pub fn check_version(&self) -> Result<()> {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             bail!("Database was created by a newer nplank version");
         }
-        self.db.pragma_update(None, "user_version", 2)?;
+        self.db.pragma_update(None, "user_version", 3)?;
         Ok(())
     }
 }

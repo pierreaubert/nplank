@@ -10,11 +10,51 @@ build:
 build-plank:
     cd plank && cargo build
 
+# Graphical engine with WASM frames, built-in editing and Rust Gemma inference.
+build-plank-gui:
+    cd plank && cargo build --no-default-features --features builtin_editor,plugins,gemma
+
+# Real native UI and daemon with disposable state and a model-free Plank engine.
+qa-ui:
+    cd plank && PLANK_NO_DS4=1 cargo build --no-default-features --features builtin_editor,plugins,gemma --bin plank
+    cargo build --features test-engine --bin nplank --bin nplankd --bin nplank-ui-qa
+    cargo run --features test-engine --bin nplank-ui-qa
+
 # Model-free regression for the actual engine's console control path.
 check-plank-controls:
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_controls_never_become_model_prompts
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib gui_
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib history_rewind
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib branch::tests
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_startup_downloads
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_completion_notifications
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote::control::tests::notify_
+    cargo test --lib notification
+    cargo test --lib transcript_
+    cargo test --lib command_picker_aliases
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib live_controls
+    cargo test --features test-engine --lib --test recovery live_
+    cargo test --lib gui_focus
+    cargo test --features test-engine --test recovery gui_focus
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_buddy
+    cargo test --features test-engine --lib --test recovery graphical_buddy
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_buddy
+    cargo test --lib remote_buddy
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib subagent_history
+    cargo test --lib subagent_history
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib job_output
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib job_reports_bound_output
+    cargo test --lib job_output
+    cargo test --features test-engine --test recovery job_output_cancel
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib export_transfer
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib html_preview
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_frame
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_arcade
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_frames
+    cargo test graphical_frame
+    cargo test remote_frames
+    cargo test --features test-engine --test frames
+    cargo test html_preview
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --bin plank gui_console_menu_works_without_terminal_but_one_shots_do_not_prompt
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_command_output_tests
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_controls_never_enter_the_model_prompt_queue
@@ -22,12 +62,29 @@ check-plank-controls:
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib client_frame_roundtrip
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_questions
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_editors
+    cargo test --lib document_transfers
+    cargo test --lib remote_editor_saves
+    cargo test --lib console_writes
+    cargo test --lib editor_opening_streams
+    cargo test --lib editor_requests_
+    cargo test --test documents
+    cargo test --lib original_document_
+    cargo test --features test-engine --test recovery editor_uploads_
+    cargo test --features test-engine --test recovery local_editor_opening_streams
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_editor_opening_
+    cargo test --lib document::
+    cargo test --lib editor_input
+    cargo test --features test-engine --test recovery local_editor_streams
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_editor_
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_dialog_stream_pipe
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib ordinary_commands_and_prompts_are_remote_safe
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib metrics_snapshots
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib activity_snapshots
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib engine_inventory_pages
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib stats_report_renders
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib client_insights_report
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib insights_charts
+    cargo test --lib insights_charts
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_insights_stop
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib task_controls
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib templates::tests
@@ -42,6 +99,22 @@ check-plank-controls:
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_confirmations
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_remote_telemetry
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_subagent
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_aside
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib replay_instances
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib restart_handover
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib restart_completion
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib restart_notification
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_profile_restart
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib graphical_suggestions
+    cargo test --no-default-features --lib prompt_suggestions
+    cargo test --no-default-features --lib remote_restart
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib remote_stop
+    cargo test --no-default-features --lib remote_stop
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --bin plank restart_handover
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib --bin plank startup_engine_questions
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib startup_download_questions
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib --bin plank startup_trust_questions
+    cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib foreground_url_download
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib subagent_output
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib subagent_tool_notices
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib a_sub_agent_edit

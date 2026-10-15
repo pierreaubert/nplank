@@ -426,6 +426,7 @@ impl MuseHost {
             }
             "approval/request" | "approval/requested" => {
                 let approval = PendingApproval {
+                    document: None,
                     id: params["approvalId"]
                         .as_str()
                         .context("Missing approval identity")?
@@ -568,7 +569,7 @@ async fn muse(
                     host.request("approval/decide", json!({"commandId":uuid::Uuid::now_v7().to_string(), "sessionId":identity, "approvalId":approval.id, "requirementId":approval.requirement, "choiceId":choice})).await?;
                 }
                 Some(Input::Stop) | None => return Ok(()),
-                Some(Input::Observe | Input::RemoteControl(_)) => bail!("Remote attachment commands cannot be sent to Muse"),
+                Some(Input::Observe | Input::RemoteControl(_) | Input::Aside(_) | Input::LiveControl(_) | Input::FrameControl(_) | Input::StopJobOutput(_)) => bail!("Plank remote controls cannot be sent to Muse"),
             }
         }
     }

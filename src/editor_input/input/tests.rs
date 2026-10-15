@@ -3,6 +3,237 @@ use gpui::SharedString;
 use std::cell::RefCell;
 
 #[test]
+fn native_composition_crossing_rows_rebases_the_input_before_focus_handoff() {
+    use crate::document::{Document, NativeEdit};
+    for reverse in [false, true] {
+        let mut document = Document::new("ab🦀\nmiddle\nlast!");
+        let original = document.lines.clone();
+        let first = document.lines.get(0).unwrap().id.clone();
+        let last = document.lines.get(2).unwrap().id.clone();
+        let (source, column) = if reverse {
+            document.observe_selection(&last, 2, 2, false);
+            document.extend_to(&first, 1);
+            (first.clone(), 1)
+        } else {
+            document.observe_selection(&first, 1, 1, false);
+            document.extend_to(&last, 2);
+            (last.clone(), 2)
+        };
+        let source_text = document
+            .lines
+            .iter()
+            .find(|line| line.id == source)
+            .unwrap()
+            .text
+            .clone();
+        let mut input = EditState::new(&source_text);
+        input.cursor = column;
+        input.selection_anchor = None;
+        for text in ["n", "に", "日本🦀"] {
+            let range = InputEntity::native_range(&input, None);
+            InputEntity::replace_native_text(&mut input, None, text, true, None);
+            let result = document
+                .native_edit(
+                    &source,
+                    NativeEdit::Replace {
+                        range,
+                        text,
+                        composing: true,
+                        selected: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.line_id, first);
+            InputEntity::apply_native_state(&mut input, result.clone());
+            assert_eq!(input.text, document.lines.get(0).unwrap().text);
+            assert_eq!(input.marked_range, Some(1..1 + text.chars().count()));
+            assert_eq!(
+                document.navigation.as_ref().unwrap().marked,
+                input.marked_range
+            );
+            assert_eq!(document.text(), format!("a{text}st!"));
+            if source != first {
+                document.native_edit_end(&source);
+            }
+        }
+        // After the repaint, the surviving row owns subsequent native callbacks.
+        let range = InputEntity::native_range(&input, None);
+        InputEntity::replace_native_text(&mut input, None, "日本", false, None);
+        let result = document
+            .native_edit(
+                &first,
+                NativeEdit::Replace {
+                    range,
+                    text: "日本",
+                    composing: false,
+                    selected: None,
+                },
+            )
+            .unwrap();
+        InputEntity::apply_native_state(&mut input, result);
+        assert_eq!(document.text(), "a日本st!");
+        assert!(input.marked_range.is_none());
+        document.undo();
+        assert_eq!(document.lines, original);
+        document.redo();
+        assert_eq!(document.text(), "a日本st!");
+    }
+}
+
+#[test]
+fn native_document_handoff_handles_paste_unmark_and_clicking_the_original_row() {
+    use crate::document::{Document, NativeEdit};
+    let mut document = Document::new("abc\ndef");
+    let first = document.lines.get(0).unwrap().id.clone();
+    document.observe_selection(&first, 1, 1, false);
+    let result = document
+        .native_edit(
+            &first,
+            NativeEdit::Replace {
+                range: 1..1,
+                text: "X\nY",
+                composing: false,
+                selected: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(document.text(), "aX\nYbc\ndef");
+    assert_ne!(result.line_id, first);
+    assert_eq!(result.text, "Ybc");
+    assert_eq!(result.selected, 1..1);
+    // An ordinary click returns ownership to the clicked row, retiring aliases.
+    document.observe_selection(&first, 0, 0, false);
+    let result = document
+        .native_edit(
+            &first,
+            NativeEdit::Replace {
+                range: 0..0,
+                text: "secret",
+                composing: true,
+                selected: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(document.lines.get(0).unwrap().text, "secretaX");
+    assert!(!format!("{result:?}").contains("secret"));
+    assert!(result.marked.is_some());
+    let result = document.native_edit(&first, NativeEdit::Unmark).unwrap();
+    assert!(result.marked.is_none());
+    assert!(document.navigation.as_ref().unwrap().marked.is_none());
+    let saved = serde_json::to_value(&document).unwrap();
+    assert!(saved.get("native").is_none());
+    assert!(saved.get("native_source").is_none());
+    assert!(saved.get("navigation").is_none());
+}
+
+#[test]
+fn document_composition_undo_does_not_consume_typing_before_the_preedit() {
+    use crate::document::{Document, NativeEdit};
+    let mut document = Document::new("abc");
+    let id = document.lines.get(0).unwrap().id.clone();
+    document.set(&id, "abcd");
+    document
+        .native_edit(
+            &id,
+            NativeEdit::Replace {
+                range: 4..4,
+                text: "n",
+                composing: true,
+                selected: None,
+            },
+        )
+        .unwrap();
+    document
+        .native_edit(
+            &id,
+            NativeEdit::Replace {
+                range: 4..5,
+                text: "你",
+                composing: true,
+                selected: None,
+            },
+        )
+        .unwrap();
+    document
+        .native_edit(
+            &id,
+            NativeEdit::Replace {
+                range: 4..5,
+                text: "你",
+                composing: false,
+                selected: None,
+            },
+        )
+        .unwrap();
+    document.undo();
+    assert_eq!(document.text(), "abcd");
+    document.undo();
+    assert_eq!(document.text(), "abc");
+}
+
+#[test]
+fn native_ime_replaces_preedit_and_commits_as_one_undoable_edit_after_an_emoji() {
+    let mut state = EditState::new("🦀 []");
+    state.cursor = 3;
+    state.selection_anchor = None;
+    InputEntity::replace_native_text(&mut state, None, "n", true, Some(1..1));
+    assert_eq!(state.text, "🦀 [n]");
+    assert_eq!(state.marked_range, Some(3..4));
+    assert!(InputEntity::selection_from_state(&state).composing);
+    InputEntity::replace_native_text(&mut state, None, "に", true, Some(1..1));
+    assert_eq!(state.text, "🦀 [に]");
+    InputEntity::replace_native_text(&mut state, None, "日本🦀", true, Some(2..4));
+    assert_eq!(state.text, "🦀 [日本🦀]");
+    assert_eq!(state.marked_range, Some(3..6));
+    assert_eq!(state.selection_range(), Some((5, 6)));
+    assert_eq!(InputEntity::char_to_utf16(&state.text, state.cursor), 8);
+    InputEntity::replace_native_text(&mut state, None, "日本", false, None);
+    assert_eq!(state.text, "🦀 [日本]");
+    assert!(state.marked_range.is_none());
+    assert!(!InputEntity::selection_from_state(&state).composing);
+    assert!(state.undo());
+    assert_eq!(state.text, "🦀 []");
+    assert!(state.marked_range.is_none());
+    assert!(state.redo());
+    assert_eq!(state.text, "🦀 [日本]");
+    assert!(state.marked_range.is_none());
+}
+
+#[test]
+fn native_ime_explicit_utf16_ranges_and_empty_preedit_preserve_surrounding_text() {
+    let mut state = EditState::new("🦀ABCDE");
+    InputEntity::replace_native_text(&mut state, Some(3..5), "中", true, Some(0..1));
+    assert_eq!(state.text, "🦀A中DE");
+    assert_eq!(state.marked_range, Some(2..3));
+    assert_eq!(state.selection_range(), Some((2, 3)));
+    InputEntity::replace_native_text(&mut state, None, "", true, Some(0..0));
+    assert_eq!(state.text, "🦀ADE");
+    assert!(state.marked_range.is_none());
+    assert_eq!(state.cursor, 2);
+}
+
+#[test]
+fn native_ime_marks_survive_matching_parent_updates_and_retire_on_navigation_or_replacement() {
+    let mut state = EditState::new("prefix");
+    state.cursor = 6;
+    state.selection_anchor = None;
+    InputEntity::replace_native_text(&mut state, None, "かな", true, None);
+    state.sync_external_value("prefix", "prefixかな");
+    assert_eq!(state.marked_range, Some(6..8));
+    state.navigate(1, 0..0);
+    assert!(state.marked_range.is_none());
+    InputEntity::replace_native_text(&mut state, None, "仮", true, None);
+    state.sync_external_value("prefixかな", "replacement");
+    assert!(state.marked_range.is_none());
+    InputEntity::replace_native_text(&mut state, None, "secret-preedit", true, None);
+    assert!(state.marked_range.is_some());
+    assert!(!format!("{state:?}").contains("secret-preedit"));
+    state.finish_edit();
+    assert!(state.marked_range.is_none());
+    assert!(state.text.is_empty());
+}
+
+#[test]
 fn document_navigation_selects_unicode_scalars_once_without_changing_text() {
     let mut state = EditState::new("a🦀éz");
     state.navigate(1, 1..3);

@@ -3,6 +3,24 @@
 A Rust GPUI application for persistent Plank workspaces. The window is a client;
 an independent Rust daemon owns execution and SQLite owns durable state.
 
+## Checkout
+
+`plank/` is a submodule pointing at the author's Plank fork on GitHub (its
+changes are not merged upstream yet), so clone with submodules:
+
+```sh
+git clone --recurse-submodules git@github.com:pierreaubert/nplank.git
+```
+
+If you already cloned without them, fetch afterwards:
+
+```sh
+git submodule update --init --recursive
+```
+
+The `plank/` recipes (`just build-plank`, the UI QA probe's default engine
+path) expect that checkout to be present.
+
 ## Run
 
 Keep `gpui-toolkit` beside this directory. This v1 uses its source-beta crates
@@ -17,7 +35,7 @@ The app starts `nplankd` automatically and reconnects on subsequent launches.
 State defaults to this checkout's `.nplank/`; override it with `--data-dir` or
 `NPLANK_DATA_DIR`. Closing the window leaves the daemon and its runs alive.
 If an older daemon is already running, finish its runs and restart it with the
-updated binary. The current client/daemon protocol is version 28; startup reports
+updated binary. The current client/daemon protocol is version 44; startup reports
 an incompatible daemon rather than replacing a live service.
 
 On macOS, File → New Workspace (Cmd-Shift-N) creates a workspace; File → New
@@ -146,7 +164,18 @@ a command prepares the composer for explicit submission. Plank questions and
 yes/no confirmations appear as compact answer controls, including multiple
 selections and decline. The picker loads installed extension commands from the
 local engine. File, memory, and profile commands open paged editors with explicit
-Save and Cancel actions. `/engines` opens a compact chooser; downloads show progress
+Save and Cancel actions. Original documents load once per revision through bounded,
+authenticated chunks; polling snapshots contain metadata. Recovered drafts are
+preserved, and failed original loads offer Retry and Cancel.
+Long input rows display a bounded window near the caret; ellipses indicate hidden
+text, while selection and clipboard operations retain the complete value.
+Compact document history keeps small edits to long rows, splits and joins undoable
+within the existing history budget, including after draft recovery.
+Engines advertising chunked Saves accept edited drafts
+up to 32 MiB; older engines retain a 256 KiB Save limit. Opening existing files
+still has a 256 KiB limit. Oversized drafts remain editable with Save disabled.
+Browser drafts and undo history use IndexedDB; failed writes show Retry save.
+`/engines` opens a compact chooser; downloads show progress
 and offer leave/cancel controls. Profile edits offer a restart that restores the
 saved session. Engine selections persist for future fresh contexts. See [control coverage](docs/PLANK-CONTROLS.md) for the
 remaining TUI-only features and verification requirements.
@@ -155,7 +184,8 @@ Activity → Model → Downloads shows live model-update progress and the last
 result. Download/resume and cancellation controls prepare commands for explicit
 Send; cancellation can keep or delete partial files. Verified artifacts are
 preserved. Rebuild Plank to receive these snapshots. The client/daemon protocol
-is version 28; finish active runs before restarting an older daemon.
+is version 44; finish active runs before restarting an older daemon. Database
+schema 3 migrates inline editor originals into separate chunk storage atomically.
 
 Activity → Agents shows delegated tasks, running/finished state, elapsed time,
 and completed-pass input/output tokens. Report expands a bounded Markdown result
@@ -233,6 +263,19 @@ for component discovery, theme discovery, health checks, and layout validation.
 Set `GPUI_TOOLKIT_CLI` if its executable is elsewhere.
 
 ## Checks and packaging
+
+`just qa-ui` opens the real native client and daemon with a temporary database,
+workspace and engine home. It uses bundled Plank's `--fake-gpu` engine, so no
+model weights load or download. The Plank tab exercises `/command`, settings,
+`/forget qa-confirmation` approval and `/open example.rs`; the Transcript sample tab exercises context
+folding. Notifications start disabled. Closing the window or pressing Ctrl-C
+stops this launcher's sessions and daemon and removes its temporary files.
+
+To prepare files and check the engine dispatcher without opening a socket or
+window, run `cargo run --features test-engine --bin nplank-ui-qa -- --prepare-only`.
+This retains the fixture directory for inspection. The full launcher needs a
+normal desktop terminal; restricted execution sandboxes may deny its listener.
+Use `--keep-data` when retaining a full verification run for inspection.
 
 ```sh
 cargo fmt --check

@@ -3,8 +3,6 @@
 //! Credentials remain in page memory. Engines and SQLite always run in the daemon.
 
 // Rust guideline compliant 2026-02-21
-use std::path::PathBuf;
-
 use gpui::{AppContext, Context, Entity, IntoElement, Render, Window, div, prelude::*};
 use gpui_miniapp::{MiniApp, MiniAppConfig};
 use gpui_ui_kit::{Button, Input, ThemeExt};
@@ -50,17 +48,20 @@ impl BrowserView {
         self.error = None;
         cx.notify();
         cx.spawn(async move |entity, cx| {
-            let result = client.snapshot(None, 0).await;
+            let result = async {
+                client.snapshot(None, 0).await?;
+                crate::ui::restore_browser_preferences().await
+            }
+            .await;
             let _ = entity.update(cx, |view, cx| {
                 view.connecting = false;
                 match result {
-                    Ok(_) => {
+                    Ok(preferences) => {
                         view.token.clear();
                         let appearance = gpui_miniapp::web_query_param("appearance").is_some();
-                        view.workspace =
-                            Some(cx.new(|cx| {
-                                WorkspaceView::new(client, PathBuf::new(), appearance, cx)
-                            }));
+                        view.workspace = Some(cx.new(|cx| {
+                            WorkspaceView::new_browser(client, preferences, appearance, cx)
+                        }));
                     }
                     Err(error) => view.error = Some(format!("Could not connect: {error}")),
                 }
@@ -152,6 +153,23 @@ pub(crate) async fn sleep(milliseconds: i32) {
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Opens a sandboxed preview from a current user click.
+pub(crate) fn open_preview(url: &str) -> anyhow::Result<()> {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| anyhow::anyhow!("Browser document unavailable"))?;
+    let link = document
+        .create_element("a")
+        .map_err(|_| anyhow::anyhow!("Cannot prepare preview link"))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| anyhow::anyhow!("Cannot prepare preview link"))?;
+    link.set_href(url);
+    link.set_target("_blank");
+    link.set_rel("noopener noreferrer");
+    link.click();
+    Ok(())
 }
 
 /// Starts a prepared browser download from a current user click.

@@ -3,8 +3,11 @@
 // Rust guideline compliant 2026-02-21
 use serde::{Deserialize, Serialize};
 
-/// Client/daemon protocol version, including required remote input ownership fencing.
-pub const PROTOCOL_VERSION: u32 = 28;
+/// Client/daemon protocol version, including bounded UTF-8 document uploads.
+pub const PROTOCOL_VERSION: u32 = 44;
+
+/// Bounds each original-document HTTP response, including browser fetches.
+pub const EDITOR_FETCH_BYTES: usize = crate::documenttransfer::CHUNK_BYTES * 8;
 
 /// A named collection of sessions with a working directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,17 @@ pub struct PendingApproval {
     pub requirement: serde_json::Value,
     pub tool: String,
     pub arguments: String,
+    /// Original document metadata; its text is fetched separately from snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<EditorDocument>,
     pub choices: Vec<ApprovalChoice>,
+}
+
+/// Immutable metadata for one pending editor revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorDocument {
+    pub bytes: usize,
+    pub sha256: String,
 }
 
 impl PendingApproval {
@@ -164,8 +177,52 @@ pub struct EngineProgress {
     pub total: u64,
 }
 
+impl Session {
+    /// Whether the attached Plank transport accepts independent side questions.
+    pub fn can_receive_asides(&self) -> bool {
+        match self.backend {
+            Backend::Remote { .. } => true,
+            Backend::Local { .. } => self.controls.as_ref().is_some_and(|controls| {
+                controls
+                    .features
+                    .iter()
+                    .any(|feature| feature.name == "console_asides" && feature.available)
+            }),
+            _ => false,
+        }
+    }
+
+    /// Reports whether this engine advertises independent setting changes.
+    pub fn can_receive_live_controls(&self) -> bool {
+        let feature = match self.backend {
+            Backend::Local { .. } => "console_live_controls",
+            Backend::Remote { .. } => "remote_live_controls",
+            _ => return false,
+        };
+        self.controls.as_ref().is_some_and(|controls| {
+            controls
+                .features
+                .iter()
+                .any(|item| item.name == feature && item.available)
+        })
+    }
+
+    /// Checks support for one independent setting, including optional extensions.
+    pub fn can_receive_live_control(&self, control: crate::livecontrol::LiveControl) -> bool {
+        self.can_receive_live_controls()
+            && control.required_feature().is_none_or(|required| {
+                self.controls.as_ref().is_some_and(|controls| {
+                    controls
+                        .features
+                        .iter()
+                        .any(|feature| feature.name == required && feature.available)
+                })
+            })
+    }
+}
+
 /// One ordered transcript entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub sequence: i64,
     pub session_id: String,
@@ -173,9 +230,28 @@ pub struct Entry {
     pub text: String,
 }
 
+impl Entry {
+    /// Identifies context boundaries written by the daemon, including legacy records.
+    pub fn is_context_boundary(&self) -> bool {
+        self.role == "context_boundary"
+            || (self.role == "system"
+                && matches!(
+                    self.text.as_str(),
+                    "Plank replaced its conversation; earlier messages are retained for reference."
+                        | "A fresh engine context starts here; earlier messages are retained for reference."
+                ))
+    }
+}
+
 /// A workspace snapshot with a bounded transcript page.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Daemon clock for rebasing short-lived events on clients with different clocks.
+    #[serde(default)]
+    pub server_time_ms: u64,
+    /// Short-lived notices, independent of transcript and request completion.
+    #[serde(default)]
+    pub notifications: Vec<crate::notifications::Notification>,
     #[serde(default)]
     pub telemetry: std::collections::HashMap<String, EngineTelemetry>,
     #[serde(default)]
@@ -185,6 +261,9 @@ pub struct Snapshot {
     pub workspaces: Vec<Workspace>,
     pub sessions: Vec<Session>,
     pub entries: Vec<Entry>,
+    /// Independently paged side answers for the selected session.
+    #[serde(default)]
+    pub asides: Vec<Entry>,
     #[serde(default)]
     pub providers: Vec<ProviderInfo>,
 }
@@ -192,12 +271,26 @@ pub struct Snapshot {
 /// Live engine counters, kept outside the durable conversation database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineTelemetry {
+    /// Latest idle buddy image; animation data is never transcript history.
+    #[serde(default)]
+    pub buddy: Option<crate::buddyframe::Frame>,
+    /// Verified downloadable history, newest first, scoped to this generation.
+    #[serde(default)]
+    pub artifacts: Vec<EngineExport>,
+    /// Older verified files retired by the bounded history policy.
+    #[serde(default)]
+    pub artifacts_retired: u64,
+    /// Latest ephemeral WASM grid in this engine generation.
+    #[serde(default)]
+    pub frame: Option<crate::frame::Snapshot>,
     /// Most recent complete, checksum-verified export in this worker generation.
     #[serde(default)]
     pub export: Option<EngineExport>,
     /// Latest complete standalone HTML report in this worker generation.
     #[serde(default)]
     pub insights_export: Option<EngineExport>,
+    #[serde(default)]
+    pub preview_export: Option<EngineExport>,
     pub status: Option<EngineStatus>,
     pub tasks: Option<(u64, u64)>,
     #[serde(default)]
@@ -230,6 +323,38 @@ pub struct EngineTelemetry {
     pub remote_access: Option<RemoteAccess>,
 }
 
+impl EngineTelemetry {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn replace_artifacts(&mut self, artifacts: Vec<EngineExport>, retired: u64) {
+        self.export = artifacts
+            .iter()
+            .find(|file| file.purpose == ExportPurpose::Conversation)
+            .cloned();
+        self.insights_export = artifacts
+            .iter()
+            .find(|file| file.purpose == ExportPurpose::Insights)
+            .cloned();
+        self.preview_export = artifacts
+            .iter()
+            .find(|file| file.purpose == ExportPurpose::Preview)
+            .cloned();
+        self.artifacts = artifacts;
+        self.artifacts_retired = retired;
+    }
+
+    /// Returns available descriptors, including legacy latest-only snapshots.
+    pub fn available_artifacts(&self) -> Vec<&EngineExport> {
+        if self.artifacts.is_empty() {
+            [&self.export, &self.insights_export, &self.preview_export]
+                .into_iter()
+                .flatten()
+                .collect()
+        } else {
+            self.artifacts.iter().collect()
+        }
+    }
+}
+
 /// Metadata for a verified export; file bytes are retrieved separately.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineExport {
@@ -249,6 +374,7 @@ pub enum ExportPurpose {
     #[default]
     Conversation,
     Insights,
+    Preview,
 }
 
 impl EngineExport {
@@ -270,7 +396,7 @@ impl EngineExport {
                 .chars()
                 .any(|c| c.is_control() || matches!(c, '/' | '\\'))
             && matches!(self.format.as_str(), "md" | "html")
-            && (self.purpose != ExportPurpose::Insights || self.format == "html")
+            && (self.purpose == ExportPurpose::Conversation || self.format == "html")
             && self.sha256.len() == 64
             && self
                 .sha256
@@ -392,6 +518,12 @@ impl EngineTask {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineMetrics {
+    JobOutput {
+        snapshot: crate::joboutput::Page,
+    },
+    SubagentHistory {
+        snapshot: crate::subhistory::Page,
+    },
     Subagents {
         rows: Vec<EngineSubagent>,
         total: u64,
@@ -399,6 +531,8 @@ pub enum EngineMetrics {
     },
     Insights {
         markdown: String,
+        #[serde(default)]
+        charts: Vec<crate::insightchart::Chart>,
         #[serde(default)]
         html_sha256: Option<String>,
     },
@@ -433,6 +567,8 @@ impl EngineMetrics {
     /// Returns the metadata category used for replacement and display.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::JobOutput { .. } => "job_output",
+            Self::SubagentHistory { .. } => "subagent_history",
             Self::Subagents { .. } => "subagents",
             Self::Insights { .. } => "insights",
             Self::Engines { .. } => "engines",
@@ -447,6 +583,8 @@ impl EngineMetrics {
     pub fn is_valid(&self) -> bool {
         let valid_model = |model: &str| model.len() <= 256 && !model.chars().any(char::is_control);
         match self {
+            Self::JobOutput { snapshot } => snapshot.is_valid(),
+            Self::SubagentHistory { snapshot } => snapshot.is_valid(),
             Self::Subagents {
                 rows,
                 total,
@@ -496,8 +634,10 @@ impl EngineMetrics {
             Self::Insights {
                 markdown,
                 html_sha256,
+                charts,
             } => {
                 markdown.len() <= 64 * 1024
+                    && crate::insightchart::valid_charts(charts)
                     && html_sha256.as_ref().is_none_or(|hash| {
                         hash.len() == 64
                             && hash
@@ -688,9 +828,12 @@ impl ActivityDay {
     }
 }
 
-/// Detached model-update progress on the engine host.
+/// Model transfer progress on the engine host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineDownloads {
+    /// Startup transfers are cancelled through their current dialog.
+    #[serde(default)]
+    pub foreground: bool,
     pub state: Option<ModelDownload>,
     pub pending: bool,
     pub cancel_requested: Option<String>,
@@ -733,31 +876,32 @@ impl ModelDownload {
 impl EngineDownloads {
     /// Validates bounded text, artifact counts, and cancellation semantics.
     pub fn is_valid(&self) -> bool {
-        self.state.as_ref().is_none_or(|state| {
-            matches!(
-                state.phase.as_str(),
-                "rehashing"
-                    | "downloading"
-                    | "verifying"
-                    | "staged"
-                    | "failed"
-                    | "cancelled"
-                    | "unknown"
-            ) && state.set.len() <= 256
-                && state.current.len() <= 256
-                && !state.set.chars().any(char::is_control)
-                && !state.current.chars().any(char::is_control)
-                && state.index <= state.of
-                && state.done_bytes <= state.total_bytes
-                && (state.partials_kept.is_none() || state.phase == "cancelled")
-                && state
-                    .error
-                    .as_ref()
-                    .is_none_or(|error| error.len() <= 4096 && !error.chars().any(char::is_control))
-        }) && self.cancel_requested.as_ref().is_none_or(|request| {
-            matches!(request.as_str(), "keep" | "delete")
-                && self.state.as_ref().is_some_and(ModelDownload::can_cancel)
-        })
+        (!self.foreground || (!self.pending && self.state.is_some()))
+            && self.state.as_ref().is_none_or(|state| {
+                matches!(
+                    state.phase.as_str(),
+                    "rehashing"
+                        | "downloading"
+                        | "verifying"
+                        | "staged"
+                        | "failed"
+                        | "cancelled"
+                        | "unknown"
+                ) && state.set.len() <= 256
+                    && state.current.len() <= 256
+                    && !state.set.chars().any(char::is_control)
+                    && !state.current.chars().any(char::is_control)
+                    && state.index <= state.of
+                    && state.done_bytes <= state.total_bytes
+                    && (state.partials_kept.is_none() || state.phase == "cancelled")
+                    && state.error.as_ref().is_none_or(|error| {
+                        error.len() <= 4096 && !error.chars().any(char::is_control)
+                    })
+            })
+            && self.cancel_requested.as_ref().is_none_or(|request| {
+                matches!(request.as_str(), "keep" | "delete")
+                    && self.state.as_ref().is_some_and(ModelDownload::can_cancel)
+            })
     }
 }
 
@@ -857,7 +1001,7 @@ impl EngineExtensions {
     pub fn is_valid(&self) -> bool {
         matches!(
             self.kind.as_str(),
-            "plugins" | "skills" | "templates" | "hooks" | "mcp" | "agents"
+            "plugins" | "skills" | "templates" | "hooks" | "mcp" | "agents" | "frames"
         ) && self.report.len() <= 65 * 1024
             && self
                 .report
@@ -939,6 +1083,12 @@ impl EngineHistory {
 /// One page of editable engine-host settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub components: Vec<String>,
+    #[serde(default)]
+    pub components_total: u64,
     pub total: u64,
     pub page: u64,
     pub fields: Vec<EngineConfigField>,
@@ -976,10 +1126,39 @@ impl EngineConfigField {
 }
 
 impl EngineConfig {
+    /// Prepares a setter tied to this page's authoritative field and component.
+    pub fn field_command(&self, field: &EngineConfigField, value: &str) -> Option<String> {
+        let field = self
+            .fields
+            .iter()
+            .find(|candidate| candidate.path == field.path)?;
+        let global = field.command(value)?;
+        if let Some(scope) = &self.scope {
+            crate::commands::component_config_command(scope, 1)?;
+            let key = field.path.strip_prefix(&format!("pluginConfig.{scope}."))?;
+            Some(format!(
+                "/config --component {scope} set {key} {}",
+                value.trim()
+            ))
+        } else {
+            Some(global)
+        }
+    }
+
     /// Validates bounded pages and setting addresses before displaying them.
     pub fn is_valid(&self) -> bool {
         let mut paths = std::collections::HashSet::new();
-        self.page > 0
+        let mut components = std::collections::HashSet::new();
+        self.components.len() as u64 == self.components_total.min(128)
+            && self.components.iter().all(|component| {
+                crate::commands::component_config_command(component, 1).is_some()
+                    && components.insert(component)
+            })
+            && self
+                .scope
+                .as_ref()
+                .is_none_or(|scope| crate::commands::component_config_command(scope, 1).is_some())
+            && self.page > 0
             && self.page <= self.total.div_ceil(32).max(1)
             && self.fields.len() as u64
                 == self
@@ -988,6 +1167,9 @@ impl EngineConfig {
                     .min(32)
             && self.fields.iter().all(|field| {
                 field.has_valid_path()
+                    && self.scope.as_ref().is_none_or(|scope| {
+                        field.path.starts_with(&format!("pluginConfig.{scope}."))
+                    })
                     && paths.insert(&field.path)
                     && field.label.len() <= 256
                     && field.hint.len() <= 256
@@ -1103,6 +1285,21 @@ impl EngineTelemetry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    ViewFocus {
+        client_id: String,
+        session_id: Option<String>,
+        generation: u64,
+    },
+    StopJobOutput {
+        session_id: String,
+        generation: u64,
+        observer: String,
+    },
+    FrameControl {
+        session_id: String,
+        generation: u64,
+        request: crate::frame::Request,
+    },
     ConnectRemote {
         session_id: String,
     },
@@ -1193,6 +1390,85 @@ pub struct Receipt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn component_config_pages_bind_setters_to_the_authoritative_scope() {
+        let field = super::EngineConfigField {
+            path: "pluginConfig.dev.demo.mode".into(),
+            label: "mode".into(),
+            value: "easy".into(),
+            hint: "easy, hard".into(),
+            editable: true,
+        };
+        let mut config = super::EngineConfig {
+            scope: Some("dev.demo".into()),
+            components: vec!["dev.demo".into()],
+            components_total: 1,
+            total: 1,
+            page: 1,
+            fields: vec![field.clone()],
+        };
+        assert!(config.is_valid());
+        assert_eq!(
+            config.field_command(&field, "hard"),
+            Some("/config --component dev.demo set mode hard".into())
+        );
+        assert!(config.field_command(&field, "hard\n/quit").is_none());
+        config.fields[0].editable = false;
+        assert!(config.field_command(&field, "hard").is_none());
+        config.fields[0].editable = true;
+        config.scope = Some("another".into());
+        assert!(!config.is_valid());
+        assert!(config.field_command(&field, "hard").is_none());
+        let legacy: super::EngineConfig = serde_json::from_value(serde_json::json!({
+            "total":1, "page":1, "fields":[field],
+        }))
+        .unwrap();
+        assert!(legacy.is_valid());
+        assert_eq!(
+            legacy.field_command(&legacy.fields[0], "hard"),
+            Some("/config pluginConfig.dev.demo.mode hard".into())
+        );
+        for id in ["two words", "a\n/quit", ""] {
+            assert!(crate::commands::component_config_command(id, 1).is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn export_inventory_rebuilds_latest_fields_and_reads_legacy_snapshots() {
+        let old = super::EngineExport {
+            purpose: super::ExportPurpose::Conversation,
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "same.html".into(),
+            format: "html".into(),
+            bytes: 1,
+            sha256: "a".repeat(64),
+        };
+        let mut preview = old.clone();
+        preview.id = uuid::Uuid::new_v4().to_string();
+        preview.purpose = super::ExportPurpose::Preview;
+        let mut newest = old.clone();
+        newest.id = uuid::Uuid::new_v4().to_string();
+        let files = vec![newest.clone(), preview.clone(), old.clone()];
+        let mut telemetry = super::EngineTelemetry::default();
+        telemetry.replace_artifacts(files.clone(), 0);
+        assert_eq!(telemetry.export.as_ref(), Some(&newest));
+        assert_eq!(telemetry.preview_export.as_ref(), Some(&preview));
+        assert_eq!(
+            telemetry.available_artifacts(),
+            files.iter().collect::<Vec<_>>()
+        );
+        let mut legacy = serde_json::to_value(&telemetry).unwrap();
+        legacy.as_object_mut().unwrap().remove("artifacts");
+        legacy.as_object_mut().unwrap().remove("artifacts_retired");
+        let legacy: super::EngineTelemetry = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.available_artifacts(), vec![&newest, &preview]);
+        telemetry.replace_artifacts(vec![newest.clone()], 2);
+        assert!(telemetry.preview_export.is_none());
+        assert_eq!(telemetry.available_artifacts(), vec![&newest]);
+        assert_eq!(telemetry.artifacts_retired, 2);
+    }
+
     use super::Command;
 
     #[test]

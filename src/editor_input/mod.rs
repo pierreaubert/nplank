@@ -8,4 +8,5 @@
     reason = "Retain the ejected toolkit API for upstream comparisons"
 )]
 mod input;
+pub(crate) use input::DocumentPointer;
 pub(crate) use input::{Input, InputSize, cleanup_stale_input_states};

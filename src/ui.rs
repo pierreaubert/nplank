@@ -3,7 +3,7 @@
 // Rust guideline compliant 2026-02-21
 use crate::{
     client::Client,
-    model::{AgentProvider, Backend, Command, Entry, Session, Snapshot},
+    model::{AgentProvider, Backend, Command, Session, Snapshot},
 };
 use gpui::{App, Context, SharedString, Window, div, prelude::*, px};
 use gpui_design::{DesignExt, DesignSystem, DesignSystemState};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -72,8 +72,87 @@ struct WorkspaceTheme {
 #[derive(Debug)]
 enum Operation {
     Select(Option<String>, i64),
+    AsidePage(i64),
     Command(Command),
+    FrameControl(Command),
     Download(ExportDownload),
+    Preview(ExportPreview),
+    LoadDocument(DocumentLoad, futures_util::future::AbortRegistration),
+}
+
+#[derive(Debug)]
+struct DocumentLoad {
+    attempt: uuid::Uuid,
+    key: String,
+    session: String,
+    editor: crate::model::PendingApproval,
+}
+
+#[derive(Debug)]
+struct DocumentJob {
+    attempt: uuid::Uuid,
+    abort: futures_util::future::AbortHandle,
+}
+
+impl DocumentLoad {
+    fn finish_job(&self, jobs: &mut HashMap<String, DocumentJob>) -> bool {
+        if jobs
+            .get(&self.key)
+            .is_some_and(|job| job.attempt == self.attempt)
+        {
+            jobs.remove(&self.key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn install(
+        &self,
+        snapshot: &Snapshot,
+        documents: &mut HashMap<String, crate::document::Document>,
+        document: crate::document::Document,
+    ) -> bool {
+        if !self.is_current(snapshot) {
+            return false;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = documents.entry(self.key.clone())
+        {
+            entry.insert(document);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_current(&self, snapshot: &Snapshot) -> bool {
+        snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == self.session)
+            .is_some_and(|session| {
+                session.approvals.iter().any(|editor| {
+                    editor.id == self.editor.id
+                        && editor.requirement == self.editor.requirement
+                        && editor.document == self.editor.document
+                })
+            })
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPreview {
+    url: String,
+    #[cfg(not(target_family = "wasm"))]
+    directory: tempfile::TempDir,
+}
+
+#[derive(Debug)]
+struct ExportPreview {
+    key: String,
+    session: String,
+    generation: u64,
+    export: crate::model::EngineExport,
 }
 
 #[derive(Debug)]
@@ -86,34 +165,96 @@ struct ExportDownload {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+enum TaskForm {
+    Add,
+    Rename(crate::model::EngineTask),
+    Active(crate::model::EngineTask),
+    Goal,
+}
+
+impl TaskForm {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Rename(_) => "rename",
+            Self::Active(_) => "active",
+            Self::Goal => "goal",
+        }
+    }
+    fn task(&self) -> Option<&crate::model::EngineTask> {
+        match self {
+            Self::Rename(task) | Self::Active(task) => Some(task),
+            _ => None,
+        }
+    }
+    fn is_current(&self, rows: Option<&[crate::model::EngineTask]>) -> bool {
+        self.task().is_none_or(|original| {
+            rows.is_some_and(|rows| {
+                rows.iter().any(|task| {
+                    task.id == original.id
+                        && task.subject == original.subject
+                        && task.active_form == original.active_form
+                })
+            })
+        })
+    }
+    fn command(&self, value: &str, iterations: &str) -> Option<String> {
+        match self {
+            Self::Goal => crate::commands::goal_command(value, iterations),
+            Self::Rename(task) if value.trim() == task.subject.trim() => None,
+            Self::Active(task)
+                if value.trim() == task.active_form.as_deref().unwrap_or_default().trim() =>
+            {
+                None
+            }
+            _ => crate::commands::task_edit_command(
+                self.mode(),
+                self.task().map(|task| task.id),
+                value,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ActivityTab {
     #[default]
     Tasks,
     Jobs,
     Agents,
+    Asides,
     Model,
     Sessions,
     Config,
     History,
     Extensions,
     Cache,
+    Frames,
+    Artifacts,
 }
 
 #[derive(Debug)]
 enum Update {
-    Snapshot(Option<String>, Snapshot),
+    DocumentLoaded(
+        Box<(
+            DocumentLoad,
+            std::result::Result<crate::document::Document, String>,
+        )>,
+    ),
+    Snapshot(Option<String>, i64, i64, Box<Snapshot>),
     Selected(String),
     WorkspaceCreated(String),
     Error(String),
     Accepted(Option<(String, String)>),
     ExportFinished(String, std::result::Result<String, String>),
+    PreviewReady(String, PreparedPreview),
     #[cfg(target_family = "wasm")]
     ExportReady(String, String, String),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Preferences {
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct Preferences {
     #[serde(default)]
     documents: HashMap<String, crate::document::Document>,
     theme: usize,
@@ -130,10 +271,24 @@ struct Preferences {
 /// A responsive workspace shell with a background-only network bridge.
 #[derive(Debug)]
 pub struct WorkspaceView {
+    notification_tracker: crate::notifications::Tracker,
+    notification_delivery: crate::notifications::Delivery,
+    document_pointer: std::rc::Rc<std::cell::RefCell<crate::editor_input::DocumentPointer>>,
+    buddy_image: Option<(String, u64, [u8; 32], Arc<gpui::RenderImage>)>,
+    focus_pending: Arc<Mutex<Option<Command>>>,
+    focus_client: String,
+    focus_active: bool,
+    focus_tick: u8,
+    focus_last: Option<(Option<String>, u64)>,
+    focus_subscription: Option<gpui::Subscription>,
     composer_focus: gpui::FocusHandle,
     command_focus: gpui::FocusHandle,
     document_search_focus: gpui::FocusHandle,
+    task_form_focus: gpui::FocusHandle,
+    conversation_form_focus: gpui::FocusHandle,
+    frame_text_focus: gpui::FocusHandle,
     command_scroll: gpui::ScrollHandle,
+    job_output_scroll: gpui::ScrollHandle,
     command_cursor: usize,
     command_dismissed: bool,
     focus_commands: bool,
@@ -154,7 +309,15 @@ pub struct WorkspaceView {
     error: Option<String>,
     connected: bool,
     export_jobs: HashSet<String>,
+    document_jobs: HashMap<String, DocumentJob>,
+    document_errors: HashMap<String, String>,
     export_feedback: Option<(String, String)>,
+    preview_urls: HashMap<String, String>,
+    frame_surfaces: HashMap<String, (crate::frame::Snapshot, gpui_ui_kit::scene2d::Scene2DState)>,
+    frame_cursors: HashMap<String, (u16, u16)>,
+    frame_expanded: HashSet<String>,
+    #[cfg(not(target_family = "wasm"))]
+    preview_files: HashMap<String, tempfile::TempDir>,
     #[cfg(target_family = "wasm")]
     browser_exports: HashMap<String, (String, String)>,
     show_new: bool,
@@ -170,6 +333,8 @@ pub struct WorkspaceView {
     history_tree: bool,
     task_full_report: bool,
     task_edit_id: Option<u32>,
+    task_form: Option<TaskForm>,
+    conversation_form: Option<crate::commands::ConversationEdit>,
     saved_current: bool,
     extension_kind: &'static str,
     extension_template: Option<String>,
@@ -183,17 +348,38 @@ pub struct WorkspaceView {
     #[cfg(not(target_family = "wasm"))]
     directory: PathBuf,
     before: i64,
+    aside_before: i64,
     mobile_sidebar: bool,
     #[cfg(not(target_family = "wasm"))]
     preferences_modified: Option<std::time::SystemTime>,
+    /// Last preference state this window loaded or attempted to save, used
+    /// as the baseline for per-key merging with other windows' writes.
+    #[cfg(not(target_family = "wasm"))]
+    preferences_base: Preferences,
     #[cfg(target_family = "wasm")]
     preferences_saved: Option<String>,
+    #[cfg(target_family = "wasm")]
+    preference_writer: crate::browser_preferences::Writer,
+    #[cfg(target_family = "wasm")]
+    preference_error: Option<String>,
 }
 
-#[cfg(target_family = "wasm")]
 impl Drop for WorkspaceView {
     fn drop(&mut self) {
+        for job in self.document_jobs.values() {
+            job.abort.abort();
+        }
+        *self.focus_pending.lock().expect("focus presence poisoned") = Some(Command::ViewFocus {
+            client_id: self.focus_client.clone(),
+            session_id: None,
+            generation: 0,
+        });
+        #[cfg(target_family = "wasm")]
         for (_, (url, _)) in self.browser_exports.drain() {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        }
+        #[cfg(target_family = "wasm")]
+        for (_, url) in self.preview_urls.drain() {
             let _ = web_sys::Url::revoke_object_url(&url);
         }
     }
@@ -211,15 +397,24 @@ impl WorkspaceView {
         }) {
             return;
         }
-        self.show_commands = !self.show_commands;
+        if self.show_commands {
+            self.show_commands = false;
+            self.focus_commands = false;
+        } else {
+            self.show_command_picker();
+        }
+        cx.notify();
+    }
+
+    fn show_command_picker(&mut self) {
+        self.show_commands = true;
         self.appearance = false;
         self.details = false;
         self.show_new = false;
         self.command_query.clear();
         self.command_cursor = 0;
         self.command_dismissed = false;
-        self.focus_commands = self.show_commands;
-        cx.notify();
+        self.focus_commands = true;
     }
 
     fn prepare_command(&mut self, name: &str, has_args: bool, cx: &mut Context<Self>) {
@@ -306,12 +501,39 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Self {
         let preferences = load_preferences(&directory);
+        Self::with_preferences(client, directory, appearance, preferences, cx)
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn new_browser(
+        client: Client,
+        preferences: Preferences,
+        appearance: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_preferences(client, PathBuf::new(), appearance, preferences, cx)
+    }
+
+    fn with_preferences(
+        client: Client,
+        directory: PathBuf,
+        appearance: bool,
+        preferences: Preferences,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        #[cfg(target_family = "wasm")]
+        let _ = &directory;
+        let focus_pending = Arc::new(Mutex::new(None));
         let (tx, rx) = if appearance {
             let (tx, _) = mpsc::channel();
             let (_, rx) = mpsc::channel();
             (tx, rx)
         } else {
-            bridge(client, preferences.selected.clone())
+            bridge(
+                client,
+                preferences.selected.clone(),
+                Arc::clone(&focus_pending),
+            )
         };
         let mut fields = HashMap::new();
         fields.insert("workspace-name".into(), "My workspace".into());
@@ -329,26 +551,46 @@ impl WorkspaceView {
         fields.insert("remote-url".into(), "ws://127.0.0.1:9000/".into());
         fields.insert("remote-token-env".into(), "PLANK_REMOTE_TOKEN".into());
         cx.spawn(async move |entity, cx| {
+            let mut interval = 100;
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(100))
+                    .timer(Duration::from_millis(interval))
                     .await;
-                if entity
-                    .update(cx, |view, cx| {
-                        view.poll(cx);
-                    })
-                    .is_err()
-                {
-                    break;
+                match entity.update(cx, |view, cx| {
+                    view.poll(cx);
+                    if view
+                        .snapshot
+                        .telemetry
+                        .values()
+                        .any(|value| value.frame.is_some() || value.buddy.is_some())
+                    {
+                        50
+                    } else {
+                        100
+                    }
+                }) {
+                    Ok(next) => interval = next,
+                    Err(_) => break,
                 }
             }
         })
         .detach();
         let view = Self {
+            buddy_image: None,
+            focus_pending,
+            focus_client: uuid::Uuid::new_v4().to_string(),
+            focus_active: false,
+            focus_tick: 0,
+            focus_last: None,
+            focus_subscription: None,
             composer_focus: cx.focus_handle(),
             command_focus: cx.focus_handle(),
             document_search_focus: cx.focus_handle(),
+            task_form_focus: cx.focus_handle(),
+            conversation_form_focus: cx.focus_handle(),
+            frame_text_focus: cx.focus_handle(),
             command_scroll: gpui::ScrollHandle::new(),
+            job_output_scroll: gpui::ScrollHandle::new(),
             command_cursor: 0,
             command_dismissed: false,
             focus_commands: false,
@@ -361,6 +603,9 @@ impl WorkspaceView {
             workspace: None,
             drafts: preferences.drafts.clone(),
             documents: preferences.documents.clone(),
+            notification_tracker: Default::default(),
+            notification_delivery: Default::default(),
+            document_pointer: Default::default(),
             pending_prompts: preferences.pending_prompts.clone(),
             collapsed: preferences.collapsed.clone(),
             fields,
@@ -369,7 +614,15 @@ impl WorkspaceView {
             error: None,
             connected: false,
             export_jobs: HashSet::new(),
+            document_jobs: HashMap::new(),
+            document_errors: HashMap::new(),
             export_feedback: None,
+            preview_urls: HashMap::new(),
+            frame_surfaces: HashMap::new(),
+            frame_cursors: HashMap::new(),
+            frame_expanded: HashSet::new(),
+            #[cfg(not(target_family = "wasm"))]
+            preview_files: HashMap::new(),
             #[cfg(target_family = "wasm")]
             browser_exports: HashMap::new(),
             show_new: false,
@@ -385,6 +638,8 @@ impl WorkspaceView {
             history_tree: false,
             task_full_report: false,
             task_edit_id: None,
+            task_form: None,
+            conversation_form: None,
             extension_kind: "plugins",
             extension_template: None,
             model_view: "settings",
@@ -394,21 +649,29 @@ impl WorkspaceView {
             command_query: String::new(),
             expanded: HashSet::new(),
             draft_dirty: false,
+            #[cfg(not(target_family = "wasm"))]
+            preferences_base: preferences.clone(),
             preferences,
             #[cfg(not(target_family = "wasm"))]
             directory,
             before: 0,
+            aside_before: 0,
             mobile_sidebar: false,
             #[cfg(not(target_family = "wasm"))]
             preferences_modified: None,
             #[cfg(target_family = "wasm")]
             preferences_saved: None,
+            #[cfg(target_family = "wasm")]
+            preference_writer: crate::browser_preferences::Writer::default(),
+            #[cfg(target_family = "wasm")]
+            preference_error: None,
         };
         view.apply_appearance(cx);
         view
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        self.publish_view_focus();
         let mut changed = false;
         #[cfg(target_os = "macos")]
         {
@@ -422,6 +685,12 @@ impl WorkspaceView {
         }
         #[cfg(target_family = "wasm")]
         {
+            if let Some(error) = self.preference_writer.take_error() {
+                self.preference_error = Some(format!(
+                    "Could not save browser drafts: {error}. Keep this page open and retry."
+                ));
+                changed = true;
+            }
             let saved = browser_preferences();
             if saved != self.preferences_saved {
                 if let Some(saved) = &saved
@@ -455,20 +724,50 @@ impl WorkspaceView {
         while let Ok(update) = self.rx.try_recv() {
             changed = true;
             match update {
-                Update::Snapshot(selected, snapshot) => {
+                Update::Snapshot(selected, before, aside_before, mut snapshot) => {
                     self.connected = true;
+                    let client_now = crate::notifications::now_ms();
+                    let server_now = snapshot.server_time_ms;
+                    snapshot
+                        .notifications
+                        .retain_mut(|notice| notice.rebase(server_now, client_now));
+                    let sessions = &snapshot.sessions;
+                    snapshot.notifications.retain(|notice| {
+                        sessions.iter().any(|session| {
+                            session.id == notice.session_id
+                                && session.generation == notice.generation
+                                && !session.archived
+                                && !session.recovery_required
+                        })
+                    });
+                    let focused = self.focus_active && !self.appearance && !self.show_new;
+                    let viewed = self.selected.clone();
+                    for notice in self.notification_tracker.take(
+                        &snapshot.notifications,
+                        crate::notifications::now_ms(),
+                        |id| focused && viewed.as_deref() == Some(id),
+                    ) {
+                        self.notification_delivery.send(notice);
+                    }
                     if selected == self.selected {
-                        self.snapshot = snapshot;
+                        // A polling response may arrive after either page was changed.
+                        if before != self.before {
+                            snapshot.entries = std::mem::take(&mut self.snapshot.entries);
+                        }
+                        if aside_before != self.aside_before {
+                            snapshot.asides = std::mem::take(&mut self.snapshot.asides);
+                        }
+                        self.snapshot = *snapshot;
                     } else {
                         self.snapshot.workspaces = snapshot.workspaces;
                         self.snapshot.sessions = snapshot.sessions;
                     }
+                    self.refresh_buddy_image();
                     for session in &self.snapshot.sessions {
-                        for editor in session
-                            .approvals
-                            .iter()
-                            .filter(|approval| approval.requirement["kind"] == "plank_editor")
-                        {
+                        for editor in session.approvals.iter().filter(|approval| {
+                            approval.requirement["kind"] == "plank_editor"
+                                && approval.document.is_none()
+                        }) {
                             self.documents
                                 .entry(document_key(&session.id, editor))
                                 .or_insert_with(|| {
@@ -484,6 +783,69 @@ impl WorkspaceView {
                         }
                         current
                     });
+                    self.preview_urls.retain(|key, url| {
+                        let current = snapshot_has_export(&self.snapshot, key);
+                        #[cfg(target_family = "wasm")]
+                        if !current {
+                            let _ = web_sys::Url::revoke_object_url(url);
+                        }
+                        #[cfg(not(target_family = "wasm"))]
+                        let _ = url;
+                        current
+                    });
+                    #[cfg(not(target_family = "wasm"))]
+                    self.preview_files
+                        .retain(|key, _| self.preview_urls.contains_key(key));
+                    let mut live_frames = HashSet::new();
+                    for session in &self.snapshot.sessions {
+                        if let Some(frame) = self
+                            .snapshot
+                            .telemetry
+                            .get(&session.id)
+                            .and_then(|value| value.frame.as_ref())
+                        {
+                            let key = export_key(&session.id, session.generation, &frame.id);
+                            live_frames.insert(key.clone());
+                            match self.frame_surfaces.get_mut(&key) {
+                                Some((previous, state)) if previous != frame => {
+                                    let mut scene = crate::frame_view::scene(frame);
+                                    scene.revision = state.scene().revision.saturating_add(1);
+                                    if let Err(error) = state.replace_scene(scene) {
+                                        self.error = Some(error.to_string());
+                                    }
+                                    *previous = frame.clone();
+                                }
+                                None => match gpui_ui_kit::scene2d::Scene2DState::new(
+                                    crate::frame_view::scene(frame),
+                                ) {
+                                    Ok(state) => {
+                                        self.frame_surfaces.insert(key, (frame.clone(), state));
+                                        if self.selected.as_deref() == Some(&session.id) {
+                                            self.show_tasks = true;
+                                            self.activity_tab = ActivityTab::Frames;
+                                        }
+                                    }
+                                    Err(error) => self.error = Some(error.to_string()),
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                    self.frame_surfaces.retain(|key, state| {
+                        let keep = live_frames.contains(key);
+                        if !keep {
+                            state.1.remove();
+                        }
+                        keep
+                    });
+                    self.frame_cursors
+                        .retain(|key, _| live_frames.contains(key));
+                    self.frame_expanded.retain(|key| live_frames.contains(key));
+                    self.fields.retain(|key, _| {
+                        key.strip_prefix("frame-text:").is_none_or(|frame| {
+                            live_frames.contains(frame.strip_suffix(":open").unwrap_or(frame))
+                        })
+                    });
                     if self.selected.is_none()
                         && let Some(session) = self.snapshot.sessions.iter().find(|s| !s.archived)
                     {
@@ -495,9 +857,30 @@ impl WorkspaceView {
                     self.show_new = false;
                     self.error = None;
                 }
+                Update::DocumentLoaded(loaded) => {
+                    let (request, result) = *loaded;
+                    if !request.finish_job(&mut self.document_jobs) {
+                        continue;
+                    }
+                    if request.is_current(&self.snapshot)
+                        && !self.documents.contains_key(&request.key)
+                    {
+                        match result {
+                            Ok(document) => {
+                                self.document_errors.remove(&request.key);
+                                self.draft_dirty |=
+                                    request.install(&self.snapshot, &mut self.documents, document);
+                            }
+                            Err(error) => {
+                                self.document_errors.insert(request.key, error);
+                            }
+                        }
+                    }
+                }
                 Update::Error(error) => {
                     if error.starts_with("Daemon disconnected:") {
                         self.connected = false;
+                        self.buddy_image = None;
                     }
                     self.error = Some(error);
                 }
@@ -522,6 +905,27 @@ impl WorkspaceView {
                         result.unwrap_or_else(|error| format!("Download failed: {error}")),
                     ));
                 }
+                Update::PreviewReady(key, preview) => {
+                    let url = preview.url;
+                    self.export_jobs.remove(&key);
+                    if snapshot_has_export(&self.snapshot, &key) {
+                        // Keep only one prepared preview to bound memory and temporary files.
+                        #[cfg(target_family = "wasm")]
+                        for (_, old) in self.preview_urls.drain() {
+                            let _ = web_sys::Url::revoke_object_url(&old);
+                        }
+                        #[cfg(not(target_family = "wasm"))]
+                        {
+                            self.preview_urls.clear();
+                            self.preview_files.clear();
+                            self.preview_files.insert(key.clone(), preview.directory);
+                        }
+                        self.preview_urls.insert(key, url);
+                    } else {
+                        #[cfg(target_family = "wasm")]
+                        let _ = web_sys::Url::revoke_object_url(&url);
+                    }
+                }
                 #[cfg(target_family = "wasm")]
                 Update::ExportReady(key, url, name) => {
                     self.export_jobs.remove(&key);
@@ -538,9 +942,158 @@ impl WorkspaceView {
                 }
             }
         }
+        let snapshot = &self.snapshot;
+        let selected = self.selected.as_deref();
+        self.document_jobs.retain(|key, job| {
+            let current = snapshot
+                .sessions
+                .iter()
+                .filter(|session| selected == Some(&session.id))
+                .any(|session| {
+                    session
+                        .approvals
+                        .iter()
+                        .any(|editor| document_key(&session.id, editor) == *key)
+                });
+            if !current {
+                job.abort.abort();
+            }
+            current
+        });
+        self.request_document();
         if changed {
             cx.notify();
         }
+    }
+
+    fn request_document(&mut self) {
+        // One original-document load per view bounds in-flight response memory.
+        if self.appearance_only || !self.document_jobs.is_empty() {
+            return;
+        }
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| self.selected.as_deref() == Some(&session.id))
+        else {
+            return;
+        };
+        let Some(editor) = session.approvals.iter().find(|editor| {
+            let key = document_key(&session.id, editor);
+            editor.document.is_some()
+                && !self.documents.contains_key(&key)
+                && !self.document_errors.contains_key(&key)
+        }) else {
+            return;
+        };
+        let request = DocumentLoad {
+            attempt: uuid::Uuid::new_v4(),
+            key: document_key(&session.id, editor),
+            session: session.id.clone(),
+            editor: editor.clone(),
+        };
+        let key = request.key.clone();
+        let attempt = request.attempt;
+        let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+        match self.tx.send(Operation::LoadDocument(request, registration)) {
+            Ok(()) => {
+                self.document_jobs
+                    .insert(key, DocumentJob { attempt, abort });
+            }
+            Err(_) => {
+                self.document_errors
+                    .insert(key, "Document worker stopped".into());
+            }
+        }
+    }
+
+    fn refresh_buddy_image(&mut self) {
+        let desired = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| {
+                self.selected.as_deref() == Some(&session.id)
+                    && session.state == crate::model::RunState::Idle
+                    && !session.recovery_required
+                    && !session.archived
+            })
+            .and_then(|session| {
+                self.snapshot
+                    .telemetry
+                    .get(&session.id)?
+                    .buddy
+                    .as_ref()
+                    .map(|frame| (session, frame))
+            });
+        let Some((session, frame)) = desired else {
+            self.buddy_image = None;
+            return;
+        };
+        let Some(key) = crate::buddy_view::cache_key(frame) else {
+            self.buddy_image = None;
+            return;
+        };
+        if self
+            .buddy_image
+            .as_ref()
+            .is_some_and(|(id, generation, cached_key, _)| {
+                id == &session.id && *generation == session.generation && *cached_key == key
+            })
+        {
+            return;
+        }
+        self.buddy_image = crate::buddy_view::decode(frame)
+            .ok()
+            .map(|image| (session.id.clone(), session.generation, key, image));
+    }
+
+    fn publish_view_focus(&mut self) {
+        if !self.connected || self.appearance_only {
+            return;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            self.focus_active = web_sys::window()
+                .and_then(|window| window.document())
+                .is_some_and(|document| {
+                    !document.hidden() && document.has_focus().unwrap_or(false)
+                });
+        }
+        let target = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| {
+                self.selected.as_deref() == Some(&session.id)
+                    && self.focus_active
+                    && !self.appearance
+                    && !self.show_new
+                    && !session.archived
+                    && !session.recovery_required
+                    && matches!(session.backend, Backend::Local { .. })
+                    && session.controls.as_ref().is_some_and(|controls| {
+                        controls
+                            .features
+                            .iter()
+                            .any(|feature| feature.name == "gui_focus" && feature.available)
+                    })
+            })
+            .map_or((None, 0), |session| {
+                (Some(session.id.clone()), session.generation)
+            });
+        self.focus_tick = self.focus_tick.saturating_add(1);
+        if self.focus_last.as_ref() == Some(&target) && self.focus_tick < 10 {
+            return;
+        }
+        self.focus_tick = 0;
+        self.focus_last = Some(target.clone());
+        *self.focus_pending.lock().expect("focus presence poisoned") = Some(Command::ViewFocus {
+            client_id: self.focus_client.clone(),
+            session_id: target.0,
+            generation: target.1,
+        });
     }
 
     fn select(&mut self, id: String) {
@@ -555,7 +1108,17 @@ impl WorkspaceView {
             .map(|s| s.workspace_id.clone());
         self.selected = Some(id.clone());
         self.show_tasks = false;
-        self.activity_tab = ActivityTab::Tasks;
+        let has_frame = self
+            .snapshot
+            .telemetry
+            .get(&id)
+            .is_some_and(|value| value.frame.is_some());
+        self.activity_tab = if has_frame {
+            ActivityTab::Frames
+        } else {
+            ActivityTab::Tasks
+        };
+        self.show_tasks |= has_frame;
         self.extension_kind = "plugins";
         self.extension_template = None;
         self.model_view = "settings";
@@ -565,12 +1128,16 @@ impl WorkspaceView {
         self.history_tree = false;
         self.task_full_report = false;
         self.task_edit_id = None;
+        self.task_form = None;
+        self.conversation_form = None;
         self.show_commands = false;
         self.command_dismissed = false;
         self.command_cursor = 0;
         self.preferences.selected = Some(id.clone());
         self.before = 0;
+        self.aside_before = 0;
         self.snapshot.entries.clear();
+        self.snapshot.asides.clear();
         self.mobile_sidebar = false;
         if let Some(session) = self.snapshot.sessions.iter().find(|s| s.id == id) {
             self.fields
@@ -590,7 +1157,17 @@ impl WorkspaceView {
     }
 
     fn command(&mut self, command: Command) {
-        if self.tx.send(Operation::Command(command)).is_err() {
+        if let Command::FrameControl { session_id, .. } = &command
+            && self.remote_read_only(session_id)
+        {
+            return;
+        }
+        let operation = if matches!(command, Command::FrameControl { .. }) {
+            Operation::FrameControl(command)
+        } else {
+            Operation::Command(command)
+        };
+        if self.tx.send(operation).is_err() {
             self.error = Some("Connection worker stopped; reopen the window".into());
         }
     }
@@ -677,11 +1254,152 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn can_submit(&self, session: &Session) -> bool {
+        let independent_picker = matches!(
+            session.backend,
+            Backend::Local { .. } | Backend::Remote { .. }
+        ) && self
+            .drafts
+            .get(&session.id)
+            .is_some_and(|text| crate::commands::is_picker_command(text));
+        let independent_setting = !self.remote_read_only(&session.id)
+            && self
+                .drafts
+                .get(&session.id)
+                .and_then(|text| crate::livecontrol::LiveControl::parse(text))
+                .is_some_and(|control| session.can_receive_live_control(control));
+        let independent_aside = session.can_receive_asides()
+            && self
+                .drafts
+                .get(&session.id)
+                .is_some_and(|text| crate::commands::aside_question(text).is_some());
+        let independent_output_stop = self
+            .drafts
+            .get(&session.id)
+            .is_some_and(|text| text.split_whitespace().eq(["/jobs", "unfollow"]))
+            && self.output_stop_command(session).is_some();
+        !session.archived
+            && !session.recovery_required
+            && (!session.state.busy()
+                || independent_aside
+                || independent_output_stop
+                || independent_setting
+                || independent_picker)
+            && (self
+                .snapshot
+                .telemetry
+                .get(&session.id)
+                .is_none_or(|value| value.frame.is_none())
+                || independent_aside
+                || independent_output_stop
+                || independent_setting
+                || independent_picker)
+    }
+
+    fn offered_suggestion<'a>(
+        &self,
+        session: &'a Session,
+    ) -> Option<&'a crate::commands::PromptSuggestion> {
+        if !self.connected
+            || !self.can_submit(session)
+            || self.remote_read_only(&session.id)
+            || !session.approvals.is_empty()
+            || self.show_commands
+            || self
+                .drafts
+                .get(&session.id)
+                .is_some_and(|draft| !draft.is_empty())
+        {
+            return None;
+        }
+        session
+            .controls
+            .as_ref()?
+            .suggestion
+            .as_ref()
+            .filter(|suggestion| {
+                self.fields.get(&format!(
+                    "suggestion-dismissed-{}-{}",
+                    session.id, session.generation
+                )) != Some(&suggestion.revision)
+            })
+    }
+
+    fn accept_suggestion(&mut self, id: &str, revision: &str) -> bool {
+        if self.selected.as_deref() != Some(id) {
+            return false;
+        }
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+        else {
+            return false;
+        };
+        let Some(suggestion) = self
+            .offered_suggestion(session)
+            .filter(|offer| offer.revision == revision)
+            .cloned()
+        else {
+            return false;
+        };
+        self.fields.insert(
+            format!("suggestion-dismissed-{id}-{}", session.generation),
+            suggestion.revision,
+        );
+        self.drafts.insert(id.to_owned(), suggestion.text);
+        self.draft_dirty = true;
+        true
+    }
+
     fn submit(&mut self) {
         let Some(id) = self.selected.clone() else {
             return;
         };
         let text = self.drafts.get(&id).cloned().unwrap_or_default();
+        if crate::commands::is_picker_command(&text)
+            && let Some(session) = self.snapshot.sessions.iter().find(|session| {
+                session.id == id
+                    && matches!(
+                        session.backend,
+                        Backend::Local { .. } | Backend::Remote { .. }
+                    )
+            })
+        {
+            let inspect_only = session.state.busy()
+                || session.archived
+                || session.recovery_required
+                || self.remote_read_only(&id)
+                || self
+                    .snapshot
+                    .telemetry
+                    .get(&id)
+                    .is_some_and(|telemetry| telemetry.frame.is_some());
+            self.show_command_picker();
+            if inspect_only {
+                return;
+            }
+        }
+        if text.split_whitespace().eq(["/jobs", "unfollow"])
+            && let Some(session) = self
+                .snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+            && let Some(command) = self.output_stop_command(session)
+        {
+            self.command(command);
+            return;
+        }
+        if !self
+            .snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == id && self.can_submit(session))
+        {
+            return;
+        }
         if text.trim().is_empty() {
             return;
         }
@@ -703,13 +1421,48 @@ impl WorkspaceView {
         }) {
             let mut words = text.split_whitespace();
             let tab = match words.next() {
-                Some("/config") if words.next() != Some("--resolved") => Some(ActivityTab::Config),
-                Some("/list") => Some(ActivityTab::Sessions),
-                Some("/export") => {
-                    self.saved_current = true;
-                    Some(ActivityTab::Sessions)
+                Some("/config") => {
+                    self.fields
+                        .insert("settings-section".into(), "options".into());
+                    Some(ActivityTab::Config)
                 }
-                Some("/jobs") => Some(ActivityTab::Jobs),
+                Some(
+                    command @ ("/memory" | "/remember" | "/forget" | "/edit-profile" | "/init"
+                    | "/hints" | "/notify" | "/repro" | "/debug" | "/version" | "/help"
+                    | "/history"),
+                ) => {
+                    let section = match command {
+                        "/memory" | "/remember" | "/forget" => "memory",
+                        "/edit-profile" | "/init" => "profile",
+                        "/hints" | "/notify" | "/buddy" => "session",
+                        _ => "diagnostics",
+                    };
+                    self.fields
+                        .insert("settings-section".into(), section.into());
+                    Some(ActivityTab::Config)
+                }
+                Some("/list") => Some(ActivityTab::Sessions),
+                Some("/export" | "/open") => {
+                    self.saved_current = true;
+                    Some(ActivityTab::Artifacts)
+                }
+                Some("/jobs") => {
+                    let output = match words.next() {
+                        Some("output") => text.contains("--page"),
+                        Some("follow" | "unfollow") => true,
+                        _ => false,
+                    };
+                    self.fields
+                        .insert("jobs-output-view".into(), output.to_string());
+                    Some(ActivityTab::Jobs)
+                }
+                Some("/subagent-history") => {
+                    self.fields.insert("agents-history".into(), "true".into());
+                    Some(ActivityTab::Agents)
+                }
+                Some("/btw") => Some(ActivityTab::Asides),
+                Some("/frame") => Some(ActivityTab::Frames),
+                Some("/pelota" | "/breakout" | "/matrix") => Some(ActivityTab::Frames),
                 Some("/model") => {
                     self.model_view = "downloads";
                     Some(ActivityTab::Model)
@@ -806,6 +1559,7 @@ impl WorkspaceView {
         !self.command_dismissed
             && (self.show_commands
                 || (draft.starts_with('/')
+                    && !crate::commands::is_picker_command(draft)
                     && !draft.contains(char::is_whitespace)
                     && !self.controls().iter().any(|command| command.name == draft)))
     }
@@ -880,6 +1634,7 @@ impl WorkspaceView {
             && !session.state.busy()
             && !session.recovery_required
             && !session.archived
+            && !self.remote_read_only(&session.id)
         {
             self.command(Command::Prompt {
                 session_id: session.id.clone(),
@@ -932,7 +1687,8 @@ impl WorkspaceView {
                             Some(&session.id) == self.selected.as_ref()
                                 && (session.state.busy()
                                     || session.recovery_required
-                                    || session.archived)
+                                    || session.archived
+                                    || self.remote_read_only(&session.id))
                         }))
                         .on_click(click(cx, |view, _, cx| view.reload_controls(cx))),
                 ),
@@ -1110,29 +1866,35 @@ impl WorkspaceView {
         self.preferences.collapsed = self.collapsed.clone();
         self.preferences.pending_prompts = self.pending_prompts.clone();
         #[cfg(not(target_family = "wasm"))]
-        let result = (|| -> anyhow::Result<()> {
-            use std::io::Write;
-            let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
-            file.write_all(&serde_json::to_vec(&self.preferences)?)?;
-            file.as_file().sync_all()?;
-            file.persist(self.directory.join("preferences.json"))?;
-            Ok(())
-        })();
+        let result = persist_preferences_based(
+            &self.directory,
+            &self.preferences,
+            self.appearance_only,
+            Some(&self.preferences_base),
+        );
         #[cfg(target_family = "wasm")]
         let result = (|| -> anyhow::Result<()> {
-            let storage = web_sys::window()
-                .and_then(|window| window.local_storage().ok().flatten())
-                .ok_or_else(|| anyhow::anyhow!("Browser preference storage is unavailable"))?;
-            storage
-                .set_item(
-                    "nplank.preferences",
-                    &serde_json::to_string(&self.preferences)?,
-                )
-                .map_err(|_| anyhow::anyhow!("Browser preferences could not be saved"))?;
+            let preferences = if self.appearance_only {
+                None
+            } else {
+                Some(serde_json::to_string(&self.preferences)?)
+            };
+            self.preference_writer
+                .queue(preferences, appearance_preferences(&self.preferences));
+            self.preference_error = None;
             Ok(())
         })();
-        if let Err(error) = result {
-            self.error = Some(format!("Could not save preferences: {error}"));
+        match result {
+            Ok(()) =>
+            {
+                #[cfg(not(target_family = "wasm"))]
+                if !self.appearance_only {
+                    self.preferences_base = self.preferences.clone();
+                }
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not save preferences: {error}"));
+            }
         }
     }
 
@@ -1546,20 +2308,18 @@ impl WorkspaceView {
         colors: &WorkspaceTheme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut entries: Vec<(i64, String, String)> = Vec::new();
-        for Entry {
-            sequence,
-            role,
-            text,
-            ..
-        } in &self.snapshot.entries
-        {
-            if let Some(last) = entries.last_mut().filter(|last| last.1 == *role) {
-                last.2.push_str(text);
-            } else {
-                entries.push((*sequence, role.clone(), text.clone()));
-            }
-        }
+        let boundary = (self.before == 0)
+            .then(|| crate::transcript::latest_boundary(&self.snapshot.entries))
+            .flatten();
+        let current_boundary = boundary.map(|index| self.snapshot.entries[index].sequence);
+        let show_earlier =
+            current_boundary.is_some_and(|sequence| self.expanded.contains(&sequence));
+        let start = if show_earlier {
+            0
+        } else {
+            boundary.unwrap_or(0)
+        };
+        let entries = crate::transcript::messages(&self.snapshot.entries[start..]);
         let mut transcript = div()
             .id("transcript")
             .flex_1()
@@ -1594,9 +2354,55 @@ impl WorkspaceView {
                 }),
             ));
         }
-        for (sequence, role, text) in entries {
+        if let Some(index) = boundary.filter(|index| *index > 0) {
+            let sequence = self.snapshot.entries[index].sequence;
+            let count = self.snapshot.entries[..index]
+                .iter()
+                .filter(|entry| !entry.role.starts_with("aside"))
+                .count();
+            transcript = transcript.child(
+                Button::new(
+                    format!("earlier-context-{sequence}"),
+                    format!(
+                        "{} Earlier context · {count} loaded entries",
+                        if show_earlier { "▾" } else { "▸" }
+                    ),
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, _, cx| {
+                    if !view.expanded.remove(&sequence) {
+                        view.expanded.insert(sequence);
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        for crate::transcript::Message {
+            sequence,
+            role,
+            text,
+            boundary,
+        } in entries
+        {
+            if boundary {
+                transcript = transcript.child(
+                    div()
+                        .border_t_1()
+                        .border_color(colors.muted)
+                        .py_1()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(if current_boundary == Some(sequence) {
+                            "Current conversation"
+                        } else {
+                            "Conversation boundary"
+                        }),
+                );
+                continue;
+            }
             let folded = matches!(
-                role.as_str(),
+                role,
                 "tool"
                     | "thinking"
                     | "diagnostic"
@@ -1612,7 +2418,7 @@ impl WorkspaceView {
                         format!(
                             "{} {}",
                             if expanded { "▾" } else { "▸" },
-                            role.to_uppercase()
+                            role.replace('_', " ").to_uppercase()
                         ),
                     )
                     .variant(ButtonVariant::Ghost)
@@ -1640,19 +2446,40 @@ impl WorkspaceView {
                     )
                     .child(Markdown::new(
                         SharedString::from(format!("entry-{sequence}")),
-                        text,
+                        text.into_owned(),
                     )),
             );
         }
         let id = session.id.clone();
         let weak = cx.entity().downgrade();
         let draft_id = id.clone();
-        let prompt = layout! { I #prompt [placeholder="Message your agent…"] }
+        let offer = self.offered_suggestion(session).cloned();
+        let prompt_input = layout! { I #prompt [placeholder="Message your agent…"] }
+            .placeholder(if offer.is_some() {
+                ""
+            } else {
+                "Message your agent…"
+            })
             .focus_handle(self.composer_focus.clone())
             .value(self.drafts.get(&id).cloned().unwrap_or_default())
             .disabled(session.archived)
             .on_text_change(move |text, _, cx| {
                 let _ = weak.update(cx, |view, cx| {
+                    if let Some(session) = view
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == draft_id)
+                        && let Some(suggestion) = session
+                            .controls
+                            .as_ref()
+                            .and_then(|controls| controls.suggestion.as_ref())
+                    {
+                        view.fields.insert(
+                            format!("suggestion-dismissed-{}-{}", session.id, session.generation),
+                            suggestion.revision.clone(),
+                        );
+                    }
                     view.drafts.insert(draft_id.clone(), text.into());
                     view.draft_dirty = true;
                     view.command_cursor = 0;
@@ -1663,20 +2490,63 @@ impl WorkspaceView {
             .on_change({
                 let weak = cx.entity().downgrade();
                 move |text, _, cx| {
-                    let _ = weak.update(cx, |view, cx| {
-                        if let Some(id) = &view.selected {
-                            view.drafts.insert(id.clone(), text.into());
-                        }
-                        if !view.snapshot.sessions.iter().any(|s| {
-                            Some(&s.id) == view.selected.as_ref()
-                                && (s.state.busy() || s.recovery_required || s.archived)
-                        }) {
-                            view.submit();
-                        }
-                        cx.notify();
-                    });
+                    let _ =
+                        weak.update(cx, |view, cx| {
+                            if let Some(id) = &view.selected {
+                                view.drafts.insert(id.clone(), text.into());
+                            }
+                            if !view.snapshot.sessions.iter().any(|s| {
+                                Some(&s.id) == view.selected.as_ref() && !view.can_submit(s)
+                            }) {
+                                view.submit();
+                            }
+                            cx.notify();
+                        });
                 }
             });
+        let mut prompt = div().relative().child(prompt_input);
+        if let Some(offer) = offer {
+            let tab_id = id.clone();
+            let tab_revision = offer.revision.clone();
+            prompt = prompt.on_key_down(cx.listener(
+                move |view, event: &gpui::KeyDownEvent, window, cx| {
+                    let modifiers = event.keystroke.modifiers;
+                    if event.keystroke.key == "tab"
+                        && !modifiers.shift
+                        && !modifiers.control
+                        && !modifiers.alt
+                        && !modifiers.platform
+                        && view.composer_focus.is_focused(window)
+                        && view.accept_suggestion(&tab_id, &tab_revision)
+                    {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+            ));
+            let click_id = id.clone();
+            let revision = offer.revision.clone();
+            prompt = prompt.child(
+                div()
+                    .absolute()
+                    .top(px(5.0))
+                    .left(px(8.0))
+                    .right(px(8.0))
+                    .h(px(24.0))
+                    .overflow_hidden()
+                    .child(
+                        Button::new("prompt-suggestion", offer.text)
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, move |view, window, cx| {
+                                if view.accept_suggestion(&click_id, &revision) {
+                                    view.composer_focus.focus(window, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+        }
         let stop_id = id.clone();
         let reset_id = id.clone();
         let mut composer = layout! { V[g2] {} }.child(prompt).child(
@@ -1694,9 +2564,7 @@ impl WorkspaceView {
                 .child(
                     layout! { B.primary("Send") #send }
                         .size(ButtonSize::Xs)
-                        .disabled(
-                            session.state.busy() || session.recovery_required || session.archived,
-                        )
+                        .disabled(!self.can_submit(session))
                         .on_click(click(cx, |view, _, cx| {
                             view.submit();
                             cx.notify();
@@ -1864,6 +2732,34 @@ impl WorkspaceView {
                     .child(controls),
             );
         }
+        let mut transcript = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(transcript);
+        if let Some((id, generation, _, image)) = &self.buddy_image
+            && self.connected
+            && id == &session.id
+            && *generation == session.generation
+            && session.state == crate::model::RunState::Idle
+        {
+            transcript = transcript.child(
+                div()
+                    .absolute()
+                    .right_2()
+                    .bottom_0()
+                    .w(px(120.))
+                    .h(px(100.))
+                    .max_h_full()
+                    .child(
+                        gpui::img(Arc::clone(image))
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            );
+        }
         div()
             .flex()
             .flex_col()
@@ -1928,6 +2824,147 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn open_task_form(&mut self, form: TaskForm) {
+        self.fields.retain(|key, _| !key.starts_with("task-form:"));
+        self.task_form = Some(form);
+        self.task_full_report = false;
+    }
+
+    fn task_form_panel(
+        &self,
+        session: &Session,
+        editable: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(form) = &self.task_form else {
+            return div().into_any_element();
+        };
+        let current = form.is_current(
+            self.snapshot
+                .telemetry
+                .get(&session.id)
+                .and_then(|telemetry| telemetry.task_rows.as_deref()),
+        );
+        let editable = if matches!(form, TaskForm::Goal) {
+            self.connected
+                && !self.remote_read_only(&session.id)
+                && !session.state.busy()
+                && !session.recovery_required
+                && !session.archived
+                && session.controls.as_ref().is_some_and(|catalog| {
+                    catalog
+                        .commands
+                        .iter()
+                        .any(|command| command.name == "/goal")
+                })
+        } else {
+            editable && current
+        };
+        let key = format!(
+            "task-form:{}:{}:{}:{}",
+            session.id,
+            session.generation,
+            form.mode(),
+            form.task().map_or(0, |task| task.id)
+        );
+        let default = match form {
+            TaskForm::Rename(task) => task.subject.as_str(),
+            TaskForm::Active(task) => task.active_form.as_deref().unwrap_or_default(),
+            _ => "",
+        };
+        let value = self.fields.get(&key).map_or(default, String::as_str);
+        let cap_key = format!("{key}:iterations");
+        // Match Plank's DEFAULT_MAX_ITERS while showing the cap explicitly.
+        let iterations = self.fields.get(&cap_key).map_or("20", String::as_str);
+        let command = form.command(value, iterations);
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(match form {
+                TaskForm::Add => "New task",
+                TaskForm::Rename(_) => "Subject",
+                TaskForm::Active(_) => "Active label",
+                TaskForm::Goal => "Goal",
+            });
+        let text_key = key.clone();
+        let weak = cx.entity().downgrade();
+        row = row.child(
+            div().flex_1().min_w(px(100.0)).child(
+                Input::new(SharedString::from(key))
+                    .focus_handle(self.task_form_focus.clone())
+                    .aria_label(match form {
+                        TaskForm::Goal => "Goal objective",
+                        TaskForm::Active(_) => "Task active label",
+                        _ => "Task subject",
+                    })
+                    .size(gpui_ui_kit::InputSize::Sm)
+                    .value(value)
+                    .disabled(!editable)
+                    .placeholder(if matches!(form, TaskForm::Goal) {
+                        "Objective"
+                    } else {
+                        "Label"
+                    })
+                    .on_text_change(move |text, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.fields.insert(text_key.clone(), text.into());
+                            cx.notify();
+                        });
+                    }),
+            ),
+        );
+        if matches!(form, TaskForm::Goal) {
+            let weak = cx.entity().downgrade();
+            row = row.child("Max turns").child(
+                div().w(px(60.0)).child(
+                    Input::new(SharedString::from(cap_key.clone()))
+                        .aria_label("Maximum goal iterations")
+                        .size(gpui_ui_kit::InputSize::Sm)
+                        .value(iterations)
+                        .disabled(!editable)
+                        .on_text_change(move |text, _, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.fields.insert(cap_key.clone(), text.into());
+                                cx.notify();
+                            });
+                        }),
+                ),
+            );
+        }
+        row = row
+            .child(
+                Button::new("task-form-prepare", "Prepare")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(!editable || command.is_none())
+                    .on_click(click(cx, move |view, window, cx| {
+                        if let Some(command) = &command {
+                            view.prepare_command(command, false, cx);
+                            view.task_form = None;
+                            view.composer_focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("task-form-cancel", "Cancel")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, window, cx| {
+                        view.task_form = None;
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        if !current {
+            row = row.child("Task changed. Reopen its form to edit the current task.");
+        }
+        row.into_any_element()
+    }
+
     fn task_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
         if !self.show_tasks {
             return div().into_any_element();
@@ -1937,12 +2974,15 @@ impl WorkspaceView {
             ("activity-tasks", "Tasks & goal", ActivityTab::Tasks),
             ("activity-jobs", "Jobs", ActivityTab::Jobs),
             ("activity-agents", "Agents", ActivityTab::Agents),
+            ("activity-asides", "Asides", ActivityTab::Asides),
             ("activity-model", "Model", ActivityTab::Model),
             ("activity-sessions", "Saved", ActivityTab::Sessions),
             ("activity-config", "Settings", ActivityTab::Config),
             ("activity-history", "Branches", ActivityTab::History),
             ("activity-extensions", "Extensions", ActivityTab::Extensions),
             ("activity-cache", "Cache", ActivityTab::Cache),
+            ("activity-frames", "Frames", ActivityTab::Frames),
+            ("activity-artifacts", "Files", ActivityTab::Artifacts),
         ] {
             tabs = tabs.child(
                 Button::new(id, label)
@@ -1958,12 +2998,36 @@ impl WorkspaceView {
                     })),
             );
         }
+        if self.activity_tab == ActivityTab::Frames {
+            return div()
+                .px_2()
+                .py_1()
+                .child(tabs)
+                .child(self.frame_panel(session, cx))
+                .into_any_element();
+        }
+        if self.activity_tab == ActivityTab::Artifacts {
+            return div()
+                .px_2()
+                .py_1()
+                .child(tabs)
+                .child(self.artifacts_panel(session, cx))
+                .into_any_element();
+        }
         if self.activity_tab == ActivityTab::Cache {
             return div()
                 .px_2()
                 .py_1()
                 .child(tabs)
                 .child(self.cache_panel(session, cx))
+                .into_any_element();
+        }
+        if self.activity_tab == ActivityTab::Asides {
+            return div()
+                .px_2()
+                .py_1()
+                .child(tabs)
+                .child(self.asides_panel(session, cx))
                 .into_any_element();
         }
         if self.activity_tab == ActivityTab::Extensions {
@@ -2056,8 +3120,20 @@ impl WorkspaceView {
                         self.remote_read_only(&session.id) || (id == "task-add" && !task_editable),
                     )
                     .on_click(click(cx, move |view, window, cx| {
-                        view.prepare_command(command, args, cx);
-                        view.composer_focus.focus(window, cx);
+                        match id {
+                            "task-add" => {
+                                view.open_task_form(TaskForm::Add);
+                                view.task_form_focus.focus(window, cx);
+                            }
+                            "goal-start" => {
+                                view.open_task_form(TaskForm::Goal);
+                                view.task_form_focus.focus(window, cx);
+                            }
+                            _ => {
+                                view.prepare_command(command, args, cx);
+                                view.composer_focus.focus(window, cx);
+                            }
+                        }
                         cx.notify();
                     })),
             );
@@ -2173,6 +3249,7 @@ impl WorkspaceView {
                         ("active", "Active label…", true),
                         ("active-clear", "Clear active label", false),
                     ] {
+                        let selected_task = task.clone();
                         let command = if action == "active-clear" {
                             format!("/tasks active {id} -")
                         } else {
@@ -2184,8 +3261,21 @@ impl WorkspaceView {
                                 .size(ButtonSize::Xs)
                                 .disabled(!task_editable)
                                 .on_click(click(cx, move |view, window, cx| {
-                                    view.prepare_command(&command, args, cx);
-                                    view.composer_focus.focus(window, cx);
+                                    match action {
+                                        "rename" => view.open_task_form(TaskForm::Rename(
+                                            selected_task.clone(),
+                                        )),
+                                        "active" => view.open_task_form(TaskForm::Active(
+                                            selected_task.clone(),
+                                        )),
+                                        _ => {
+                                            view.prepare_command(&command, args, cx);
+                                            view.composer_focus.focus(window, cx);
+                                        }
+                                    }
+                                    if args {
+                                        view.task_form_focus.focus(window, cx);
+                                    }
                                     cx.notify();
                                 })),
                         );
@@ -2208,10 +3298,110 @@ impl WorkspaceView {
                     .id("task-report-scroll")
                     .max_h(px(160.0))
                     .overflow_y_scroll()
+                    .child(self.task_form_panel(session, task_editable, cx))
                     .child(content),
             )
             .child(actions)
             .into_any_element()
+    }
+
+    fn asides_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let mut panel = div()
+            .id("aside-history")
+            .max_h(px(160.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs();
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .child("Side answers stay outside the agent's conversation.")
+            .child(
+                Button::new("aside-ask", "Ask…")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(
+                        (!session.can_receive_asides()
+                            && (self.remote_read_only(&session.id) || session.state.busy()))
+                            || session.archived
+                            || session.recovery_required,
+                    )
+                    .on_click(click(cx, |view, window, cx| {
+                        view.prepare_command("/btw", true, cx);
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        if self.snapshot.asides.len() >= 250
+            && let Some(first) = self.snapshot.asides.first()
+        {
+            let before = first.sequence;
+            actions = actions.child(
+                Button::new("aside-older", "Older")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.aside_before = before;
+                        let _ = view.tx.send(Operation::AsidePage(before));
+                        cx.notify();
+                    })),
+            );
+        }
+        if self.aside_before != 0 {
+            actions = actions.child(
+                Button::new("aside-live", "Live")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, _, cx| {
+                        view.aside_before = 0;
+                        let _ = view.tx.send(Operation::AsidePage(0));
+                        cx.notify();
+                    })),
+            );
+        }
+        panel = panel.child(actions);
+        let mut entries: Vec<(i64, String, String)> = Vec::new();
+        for entry in &self.snapshot.asides {
+            if let Some(last) = entries.last_mut().filter(|last| last.1 == entry.role) {
+                last.2.push_str(&entry.text);
+            } else {
+                entries.push((entry.sequence, entry.role.clone(), entry.text.clone()));
+            }
+        }
+        if entries.is_empty() {
+            panel = panel.child("Ask a side question with /btw.");
+        }
+        for (sequence, role, text) in entries {
+            let secondary = role != "aside" && role != "aside_error";
+            let expanded = self.expanded.contains(&sequence);
+            if secondary {
+                panel = panel.child(
+                    Button::new(
+                        format!("aside-fold-{sequence}"),
+                        format!(
+                            "{} {}",
+                            if expanded { "▾" } else { "▸" },
+                            role.trim_start_matches("aside_").to_uppercase()
+                        ),
+                    )
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        if !view.expanded.remove(&sequence) {
+                            view.expanded.insert(sequence);
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            if !secondary || expanded {
+                panel = panel.child(Markdown::new(format!("aside-output-{sequence}"), text));
+            }
+        }
+        panel.into_any_element()
     }
 
     fn subagents_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
@@ -2224,6 +3414,33 @@ impl WorkspaceView {
             .flex_col()
             .gap_1()
             .text_xs();
+        let history = self
+            .fields
+            .get("agents-history")
+            .is_some_and(|value| value == "true");
+        let mut tabs = div().flex().gap_1();
+        for (name, selected) in [("Live", false), ("History", true)] {
+            tabs = tabs.child(
+                Button::new(format!("agents-view-{name}"), name)
+                    .size(ButtonSize::Xs)
+                    .variant(if history == selected {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields
+                            .insert("agents-history".into(), selected.to_string());
+                        cx.notify();
+                    })),
+            );
+        }
+        panel = panel.child(tabs);
+        if history {
+            return panel
+                .child(self.subagent_history_panel(session, cx))
+                .into_any_element();
+        }
         panel = panel.child(
             layout! { B.ghost("Delegate task…") #delegate_task }
                 .size(ButtonSize::Xs)
@@ -2353,6 +3570,157 @@ impl WorkspaceView {
             panel = panel.child(
                 "Delegated activity will appear here when a rebuilt engine starts a subagent.",
             );
+        }
+        panel.into_any_element()
+    }
+
+    fn subagent_history_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let snapshot = self
+            .snapshot
+            .telemetry
+            .get(&session.id)
+            .and_then(|telemetry| telemetry.metrics.get("subagent_history"))
+            .and_then(|metrics| match metrics {
+                crate::model::EngineMetrics::SubagentHistory { snapshot } => Some(snapshot),
+                _ => None,
+            });
+        let supported = session.controls.as_ref().is_some_and(|controls| {
+            controls
+                .features
+                .iter()
+                .any(|feature| feature.name == "subagent_history" && feature.available)
+        });
+        let disabled = !supported || self.remote_read_only(&session.id);
+        let mut panel = div().child(
+            Button::new("history-agents-load", "Load / refresh completed runs")
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(disabled)
+                .on_click(click(cx, |view, window, cx| {
+                    view.prepare_command("/subagent-history", false, cx);
+                    view.composer_focus.focus(window, cx);
+                    cx.notify();
+                })),
+        );
+        let Some(snapshot) = snapshot else {
+            return panel
+                .child("Load requests retained child conversations. Send to confirm.")
+                .into_any_element();
+        };
+        panel = panel.child(format!(
+            "{} completed runs · last eight retained · text only",
+            snapshot.runs.len()
+        ));
+        let chooser_key = format!(
+            "history-agent-chooser:{}:{}",
+            session.id, session.generation
+        );
+        let choosing = self
+            .fields
+            .get(&chooser_key)
+            .is_some_and(|value| value == "true");
+        for run in snapshot.runs.iter().filter(|run| {
+            snapshot.selected.is_none() || choosing || snapshot.selected == Some(run.id)
+        }) {
+            let command = format!("/subagent-history {}", run.id);
+            let chooser_key = chooser_key.clone();
+            panel = panel.child(
+                Button::new(
+                    format!("history-agent-{}", run.id),
+                    format!("{} · {} · {}", run.id, run.label, run.task),
+                )
+                .size(ButtonSize::Xs)
+                .variant(if snapshot.selected == Some(run.id) {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .disabled(disabled)
+                .on_click(click(cx, move |view, window, cx| {
+                    view.prepare_command(&command, false, cx);
+                    view.fields.remove(&chooser_key);
+                    view.composer_focus.focus(window, cx);
+                    cx.notify();
+                })),
+            );
+        }
+        if let Some(id) = snapshot.selected {
+            let pages = snapshot
+                .total
+                .div_ceil(crate::subhistory::PAGE_CHUNKS as u64)
+                .max(1);
+            let mut navigation = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(format!("Run {id} · {}/{}", snapshot.page, pages));
+            let chooser_key = chooser_key.clone();
+            navigation = navigation.child(
+                Button::new("history-agent-change", "Change run")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields
+                            .insert(chooser_key.clone(), (!choosing).to_string());
+                        cx.notify();
+                    })),
+            );
+            for (label, page, blocked) in [
+                (
+                    "‹",
+                    snapshot.page.saturating_sub(1).max(1),
+                    snapshot.page <= 1,
+                ),
+                ("›", snapshot.page.saturating_add(1), snapshot.page >= pages),
+            ] {
+                let command = format!("/subagent-history {id} --page {page}");
+                navigation = navigation.child(
+                    Button::new(format!("history-agent-page-{label}"), label)
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .disabled(disabled || blocked)
+                        .on_click(click(cx, move |view, window, cx| {
+                            view.prepare_command(&command, false, cx);
+                            view.composer_focus.focus(window, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            let mut copied = String::new();
+            for chunk in &snapshot.chunks {
+                if !copied.is_empty() && !chunk.continued {
+                    copied.push('\n');
+                }
+                copied.push_str(&chunk.text);
+            }
+            navigation = navigation.child(
+                Button::new("history-agent-copy", "Copy page")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                    })),
+            );
+            panel = panel.child(navigation.flex_wrap());
+            for (index, chunk) in snapshot.chunks.iter().enumerate() {
+                panel = panel.child(
+                    div()
+                        .py_1()
+                        .child(format!(
+                            "{}{}",
+                            chunk.role,
+                            if chunk.continued { " · continued" } else { "" }
+                        ))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "history-chunk-{id}-{}-{index}",
+                                    snapshot.page
+                                )))
+                                .child(chunk.text.clone()),
+                        ),
+                );
+            }
         }
         panel.into_any_element()
     }
@@ -2561,6 +3929,30 @@ impl WorkspaceView {
             "agents" => Some("agent"),
             _ => None,
         };
+        if self.extension_kind == "plugins"
+            && session.controls.as_ref().is_some_and(|controls| {
+                controls
+                    .features
+                    .iter()
+                    .any(|feature| feature.name == "component_config" && feature.available)
+            })
+        {
+            panel = panel.child(self.component_picker(session, cx));
+            panel = panel.child(
+                Button::new(
+                    "extension-component-discover",
+                    "Load component settings list",
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(self.remote_read_only(&session.id))
+                .on_click(click(cx, |view, window, cx| {
+                    view.prepare_command("/config --page 1", false, cx);
+                    view.composer_focus.focus(window, cx);
+                    cx.notify();
+                })),
+            );
+        }
         if let Some(source) = source {
             let mut commands = div().flex().flex_wrap().gap_1();
             for command in session
@@ -2675,6 +4067,172 @@ impl WorkspaceView {
         panel.into_any_element()
     }
 
+    fn open_conversation_form(
+        &mut self,
+        edit: crate::commands::ConversationEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fields
+            .retain(|key, _| !key.starts_with("conversation-form:"));
+        self.conversation_form = Some(edit);
+        self.conversation_form_focus.focus(window, cx);
+    }
+
+    fn conversation_form_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        use crate::commands::ConversationEdit as Edit;
+        let Some(edit) = self.conversation_form else {
+            return div().into_any_element();
+        };
+        let supported = session.controls.as_ref().is_none_or(|catalog| {
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == edit.command_name())
+        });
+        let editable = supported
+            && !self.remote_read_only(&session.id)
+            && !session.archived
+            && !session.recovery_required;
+        let key = format!(
+            "conversation-form:{}:{}:{}",
+            session.id,
+            session.generation,
+            edit.command_name()
+        );
+        let scope_key = format!("{key}:all");
+        let all = self
+            .fields
+            .get(&scope_key)
+            .is_some_and(|value| value == "true");
+        let value = self.field(&key);
+        let phrase_supported = session.controls.as_ref().is_some_and(|catalog| {
+            catalog
+                .features
+                .iter()
+                .any(|feature| feature.name == "phrase_search" && feature.available)
+        });
+        let unsupported_phrase =
+            edit == Edit::Search && !phrase_supported && value.split_whitespace().count() > 1;
+        let command = edit
+            .prepare(&value, all)
+            .filter(|_| !unsupported_phrase && !(edit == Edit::Tag && value.trim().is_empty()));
+        let (label, hint) = match edit {
+            Edit::Rename => (
+                "Rename conversation",
+                "Letters, digits and dashes; up to 64 characters",
+            ),
+            Edit::Tag => ("Tag", "New tag"),
+            Edit::Checkpoint => ("Checkpoint", "Checkpoint name"),
+            Edit::Search => ("Search", "Query"),
+            Edit::RatePositive => ("Helpful", "Optional note"),
+            Edit::RateNegative => ("Unhelpful", "Optional note"),
+        };
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(label);
+        let weak = cx.entity().downgrade();
+        let text_key = key.clone();
+        row = row.child(
+            div().flex_1().min_w(px(100.0)).child(
+                Input::new(SharedString::from(key))
+                    .size(gpui_ui_kit::InputSize::Sm)
+                    .focus_handle(self.conversation_form_focus.clone())
+                    .aria_label(label)
+                    .placeholder(hint)
+                    .value(value.clone())
+                    .disabled(!editable)
+                    .on_text_change(move |text, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.fields.insert(text_key.clone(), text.into());
+                            cx.notify();
+                        });
+                    }),
+            ),
+        );
+        if edit == Edit::Search {
+            row = row.child(
+                Button::new(
+                    "conversation-search-scope",
+                    if all { "All projects" } else { "This project" },
+                )
+                .size(ButtonSize::Xs)
+                .variant(if all {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .disabled(!editable)
+                .on_click(click(cx, move |view, _, cx| {
+                    view.fields.insert(scope_key.clone(), (!all).to_string());
+                    cx.notify();
+                })),
+            );
+        }
+        let replacement = edit == Edit::Checkpoint
+            && self
+                .snapshot
+                .telemetry
+                .get(&session.id)
+                .and_then(|telemetry| telemetry.checkpoints.as_ref())
+                .is_some_and(|history| {
+                    history
+                        .rows
+                        .iter()
+                        .any(|point| point.key.as_deref() == Some(value.trim()))
+                });
+        let invalid = command.is_none() && !value.trim().is_empty();
+        row = row
+            .child(
+                Button::new(
+                    "conversation-form-prepare",
+                    if replacement {
+                        "Prepare replacement"
+                    } else {
+                        "Prepare"
+                    },
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(!editable || command.is_none())
+                .on_click(click(cx, move |view, window, cx| {
+                    if let Some(command) = &command {
+                        view.prepare_command(command, false, cx);
+                        view.conversation_form = None;
+                        view.composer_focus.focus(window, cx);
+                    }
+                    cx.notify();
+                })),
+            )
+            .child(
+                Button::new("conversation-form-cancel", "Cancel")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, window, cx| {
+                        view.conversation_form = None;
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        if invalid {
+            row = row.child(if unsupported_phrase {
+                "This engine supports single-word search."
+            } else {
+                match edit {
+                    Edit::Rename => "Use 1–64 ASCII letters, digits or dashes; sysprompt is reserved.",
+                    Edit::Checkpoint => "Use a checkpoint name, not --page N; one line, up to 4096 bytes.",
+                    Edit::Search => "Use one line, up to 4096 bytes; select All projects for a trailing --all option.",
+                    _ => "Use one line of at most 4096 bytes.",
+                }
+            });
+        }
+        row.into_any_element()
+    }
+
     fn history_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
         let mut panel = div()
             .id("conversation-history-controls")
@@ -2763,8 +4321,16 @@ impl WorkspaceView {
                     .variant(ButtonVariant::Ghost)
                     .disabled(disabled)
                     .on_click(click(cx, move |view, window, cx| {
-                        view.prepare_command(&text, args, cx);
-                        view.composer_focus.focus(window, cx);
+                        if id == "history-new" {
+                            view.open_conversation_form(
+                                crate::commands::ConversationEdit::Checkpoint,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            view.prepare_command(&text, args, cx);
+                            view.composer_focus.focus(window, cx);
+                        }
                         cx.notify();
                     })),
             );
@@ -2788,6 +4354,9 @@ impl WorkspaceView {
         panel = panel
             .child(actions)
             .child("Conversation history · Prepare an action, then Send");
+        if self.conversation_form == Some(crate::commands::ConversationEdit::Checkpoint) {
+            panel = panel.child(self.conversation_form_panel(session, cx));
+        }
         let Some(snapshot) = snapshot else {
             return panel.into_any_element();
         };
@@ -2830,7 +4399,127 @@ impl WorkspaceView {
         panel.into_any_element()
     }
 
+    fn component_picker(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        if !session.controls.as_ref().is_some_and(|catalog| {
+            catalog
+                .features
+                .iter()
+                .any(|feature| feature.name == "component_config" && feature.available)
+        }) {
+            return div().into_any_element();
+        }
+        let key = format!("component-config:{}:{}", session.id, session.generation);
+        let value = self.field(&key);
+        let command = crate::commands::component_config_command(value.trim(), 1);
+        let weak = cx.entity().downgrade();
+        let text_key = key.clone();
+        let mut panel = div().flex().flex_col().gap_1().text_xs();
+        let row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(
+                div().w(px(180.0)).child(
+                    Input::new(SharedString::from(key.clone()))
+                        .size(gpui_ui_kit::InputSize::Sm)
+                        .placeholder("Loaded component ID")
+                        .aria_label("Component settings ID")
+                        .value(value.clone())
+                        .disabled(self.remote_read_only(&session.id))
+                        .on_text_change(move |text, _, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.fields.insert(text_key.clone(), text.into());
+                                cx.notify();
+                            });
+                        }),
+                ),
+            )
+            .child(
+                Button::new("component-config-load", "Component settings")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(command.is_none() || self.remote_read_only(&session.id))
+                    .on_click(click(cx, move |view, window, cx| {
+                        if let Some(command) = &command {
+                            view.prepare_command(command, false, cx);
+                            view.composer_focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        panel = panel.child(row);
+        if let Some(config) = self
+            .snapshot
+            .telemetry
+            .get(&session.id)
+            .and_then(|telemetry| telemetry.config.as_ref())
+        {
+            let mut choices = div().flex().flex_wrap().gap_1();
+            for component in config
+                .components
+                .iter()
+                .filter(|component| component.contains(value.trim()))
+                .take(8)
+            {
+                let chosen = component.clone();
+                let key = key.clone();
+                choices = choices.child(
+                    Button::new(format!("component-choice-{component}"), component.clone())
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.fields.insert(key.clone(), chosen.clone());
+                            cx.notify();
+                        })),
+                );
+            }
+            panel = panel.child(choices);
+            if config.components_total > config.components.len() as u64 {
+                panel =
+                    panel.child("Suggestions are limited to 128 components; enter any loaded ID.");
+            }
+        }
+        panel.into_any_element()
+    }
+
     fn config_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let section = self
+            .fields
+            .get("settings-section")
+            .map_or("options", String::as_str);
+        let mut tabs = div().flex().flex_wrap().gap_1();
+        for (key, label) in [
+            ("options", "Options"),
+            ("memory", "Memory"),
+            ("profile", "Profile"),
+            ("session", "Session"),
+            ("diagnostics", "Diagnostics"),
+        ] {
+            tabs = tabs.child(
+                Button::new(format!("settings-tab-{key}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(if section == key {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields.insert("settings-section".into(), key.into());
+                        cx.notify();
+                    })),
+            );
+        }
+        if section != "options" {
+            return div()
+                .id("engine-settings-tools")
+                .max_h(px(160.0))
+                .overflow_y_scroll()
+                .text_xs()
+                .child(tabs)
+                .child(self.settings_tools(session, section, cx))
+                .into_any_element();
+        }
         let config = self
             .snapshot
             .telemetry
@@ -2844,23 +4533,24 @@ impl WorkspaceView {
         let page = config.map_or(1, |config| config.page);
         let pages = config.map_or(1, |config| config.total.div_ceil(32).max(1));
         let mut actions = div().flex().flex_wrap().gap_1();
+        let page_command = |page| {
+            config
+                .and_then(|config| config.scope.as_deref())
+                .and_then(|scope| crate::commands::component_config_command(scope, page))
+                .unwrap_or_else(|| format!("/config --page {page}"))
+        };
         for (id, label, command, disabled) in [
-            (
-                "config-load",
-                "Load / refresh",
-                format!("/config --page {page}"),
-                false,
-            ),
+            ("config-load", "Load / refresh", page_command(page), false),
             (
                 "config-prev",
                 "‹",
-                format!("/config --page {}", page.saturating_sub(1)),
+                page_command(page.saturating_sub(1).max(1)),
                 page <= 1,
             ),
             (
                 "config-next",
                 "›",
-                format!("/config --page {}", page.saturating_add(1)),
+                page_command(page.saturating_add(1)),
                 page >= pages,
             ),
             (
@@ -2882,7 +4572,20 @@ impl WorkspaceView {
                     })),
             );
         }
-        panel = panel.child(actions);
+        panel = panel.child(tabs).child(actions);
+        panel = panel.child(self.component_picker(session, cx));
+        if config.is_some_and(|config| config.scope.is_some()) {
+            panel = panel.child(
+                Button::new("config-global", "Global settings")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, window, cx| {
+                        view.prepare_command("/config --page 1", false, cx);
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
         let Some(config) = config else {
             return panel
                 .child("Load requests settings from this engine. Send to confirm.")
@@ -2892,6 +4595,11 @@ impl WorkspaceView {
             "{} settings · Page {page}/{pages} · Prepare, then Send to save",
             config.total
         ));
+        if let Some(scope) = &config.scope {
+            panel = panel.child(format!(
+                "Component: {scope} · saved values apply at next initialization"
+            ));
+        }
         for field in &config.fields {
             let key = format!("config-edit-{}-{}", session.id, field.path);
             let value = self
@@ -2912,7 +4620,7 @@ impl WorkspaceView {
                         cx.notify();
                     });
                 });
-            let command = field.command(&value);
+            let command = config.field_command(field, &value);
             panel = panel.child(
                 div()
                     .py_1()
@@ -2954,6 +4662,134 @@ impl WorkspaceView {
             );
         }
         panel.into_any_element()
+    }
+
+    fn settings_tools(
+        &self,
+        session: &Session,
+        section: &str,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let (description, actions): (&str, &[(&str, &str, bool)]) = match section {
+            "memory" => (
+                "Edit durable memory or prepare a note. Forget requests the engine's confirmation.",
+                &[
+                    ("Edit memory", "/memory", false),
+                    ("Change log", "/memory log", false),
+                    ("Remember · project…", "/remember", true),
+                    ("Remember · user…", "/remember user", true),
+                    ("Forget…", "/forget", true),
+                    ("Calibrate…", "/memory calibrate", true),
+                ],
+            ),
+            "profile" => (
+                "Profile edits open the shared editor; restart remains an explicit engine choice.",
+                &[
+                    ("Edit running profile", "/edit-profile", false),
+                    ("Set up repository", "/init", false),
+                ],
+            ),
+            "session" => (
+                "These controls affect the current engine session. Use Options for persisted defaults.",
+                &[
+                    ("Hints on", "/hints on", false),
+                    ("Hints off", "/hints off", false),
+                    ("Notify · always", "/notify always", false),
+                    ("Notify · unfocused", "/notify unfocused", false),
+                    ("Notify · never", "/notify never", false),
+                    ("Buddy", "/buddy", false),
+                    ("Buddy on", "/buddy on", false),
+                    ("Buddy off", "/buddy off", false),
+                    ("Choose buddy", "/buddy install", false),
+                ],
+            ),
+            _ => (
+                "Reports appear in the conversation. A reproducer is written on the engine host.",
+                &[
+                    ("Help", "/help", false),
+                    ("Version", "/version", false),
+                    ("Prompt history", "/history", false),
+                    ("Write reproducer", "/repro", false),
+                    ("Debug on", "/debug on", false),
+                    ("Debug off", "/debug off", false),
+                ],
+            ),
+        };
+        let mut buttons = div().flex().flex_wrap().gap_1();
+        #[cfg(target_family = "wasm")]
+        if section == "session" {
+            let permission = crate::notifications::Delivery::permission();
+            let label = match permission {
+                Some(web_sys::NotificationPermission::Default) => "Allow browser notifications",
+                Some(web_sys::NotificationPermission::Granted) => "Notifications allowed",
+                Some(web_sys::NotificationPermission::Denied) => "Notifications blocked",
+                _ => "Notifications unavailable",
+            };
+            buttons = buttons.child(
+                Button::new("browser-notifications", label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(permission != Some(web_sys::NotificationPermission::Default))
+                    .on_click(click(cx, |view, _, cx| {
+                        view.notification_delivery.enable();
+                        cx.notify();
+                    })),
+            );
+        }
+        for (index, &(label, command, arguments)) in actions.iter().enumerate() {
+            let name = command.split_whitespace().next().unwrap_or("");
+            let supported = session.controls.as_ref().is_some_and(|controls| {
+                controls.commands.iter().any(|entry| entry.name == name)
+                    && (name != "/buddy"
+                        || controls
+                            .features
+                            .iter()
+                            .any(|feature| feature.name == "buddy_frames" && feature.available))
+                    && (!command.starts_with("/notify ")
+                        || controls
+                            .features
+                            .iter()
+                            .any(|feature| feature.name == "notify_modes" && feature.available))
+            });
+            buttons = buttons.child(
+                Button::new(format!("settings-tool-{section}-{index}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(
+                        if session
+                            .controls
+                            .as_ref()
+                            .and_then(|controls| controls.settings.as_ref())
+                            .and_then(|settings| settings.hints)
+                            .is_some_and(|enabled| {
+                                command == if enabled { "/hints on" } else { "/hints off" }
+                            })
+                            || session
+                                .controls
+                                .as_ref()
+                                .and_then(|controls| controls.settings.as_ref())
+                                .and_then(|settings| settings.notify_mode)
+                                .is_some_and(|mode| {
+                                    command.strip_prefix("/notify ") == Some(mode.as_str())
+                                })
+                        {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        },
+                    )
+                    .disabled(!supported || self.remote_read_only(&session.id))
+                    .on_click(click(cx, move |view, window, cx| {
+                        view.prepare_command(command, arguments, cx);
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .child(description)
+            .child(buttons)
+            .child("Choose an action, review its command, then Send.")
+            .into_any_element()
     }
 
     fn saved_sessions_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
@@ -3022,13 +4858,24 @@ impl WorkspaceView {
                     .variant(ButtonVariant::Ghost)
                     .disabled(!supported || self.remote_read_only(&session.id))
                     .on_click(click(cx, move |view, window, cx| {
-                        view.prepare_command(&command, args, cx);
-                        view.composer_focus.focus(window, cx);
+                        if id == "saved-search" {
+                            view.open_conversation_form(
+                                crate::commands::ConversationEdit::Search,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            view.prepare_command(&command, args, cx);
+                            view.composer_focus.focus(window, cx);
+                        }
                         cx.notify();
                     })),
             );
         }
         panel = panel.child(actions);
+        if self.conversation_form == Some(crate::commands::ConversationEdit::Search) {
+            panel = panel.child(self.conversation_form_panel(session, cx));
+        }
         let Some(snapshot) = snapshot else {
             return panel
                 .child("Load requests saved conversations from this engine. Send to confirm.")
@@ -3091,6 +4938,507 @@ impl WorkspaceView {
         panel.into_any_element()
     }
 
+    fn frame_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let mut panel = div().flex().flex_col().gap_1();
+        let frame = self
+            .snapshot
+            .telemetry
+            .get(&session.id)
+            .and_then(|value| value.frame.as_ref());
+        let Some(frame) = frame else {
+            if session.controls.as_ref().is_some_and(|controls| {
+                controls
+                    .features
+                    .iter()
+                    .any(|feature| feature.name == "arcade" && feature.available)
+            }) {
+                let mut games = div().flex().flex_wrap().gap_1();
+                let fresh_key = format!("arcade-new:{}:{}", session.id, session.generation);
+                let fresh = self
+                    .fields
+                    .get(&fresh_key)
+                    .is_some_and(|value| value == "true");
+                games = games.child(
+                    Button::new("arcade-new", "New game")
+                        .size(ButtonSize::Xs)
+                        .variant(if fresh {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.fields.insert(fresh_key.clone(), (!fresh).to_string());
+                            cx.notify();
+                        })),
+                );
+                for (label, command) in [
+                    ("Pelota", "/pelota"),
+                    ("Breakout", "/breakout"),
+                    ("Matrix", "/matrix"),
+                ] {
+                    let prepared = if fresh {
+                        format!("{command} new")
+                    } else {
+                        command.to_owned()
+                    };
+                    games = games.child(
+                        Button::new(format!("arcade-{label}"), label)
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(!self.can_submit(session) || !self.connected)
+                            .on_click(click(cx, move |view, window, cx| {
+                                view.prepare_command(&prepared, false, cx);
+                                view.composer_focus.focus(window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+                panel = panel.child(games);
+            }
+            panel = panel.child(
+                Button::new("load-frames", "Load frames")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(
+                        !self.can_submit(session)
+                            || !self.connected
+                            || !matches!(
+                                session.backend,
+                                Backend::Local { .. } | Backend::Remote { .. }
+                            ),
+                    )
+                    .on_click(click(cx, |view, window, cx| {
+                        view.prepare_command("/frame", false, cx);
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+            if let Some(inventory) = self
+                .snapshot
+                .telemetry
+                .get(&session.id)
+                .and_then(|value| value.extensions.get("frames"))
+            {
+                panel = panel.child(
+                    div()
+                        .id("frame-inventory")
+                        .max_h(gpui::px(160.0))
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .child(inventory.report.clone()),
+                        ),
+                );
+            }
+            return panel
+                .child(
+                    Button::new("open-frame", "Open frame…")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .disabled(
+                            !self.can_submit(session)
+                                || !self.connected
+                                || self.remote_read_only(&session.id),
+                        )
+                        .on_click(click(cx, |view, window, cx| {
+                            view.prepare_command("/frame", true, cx);
+                            view.composer_focus.focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
+        };
+        let key = export_key(&session.id, session.generation, &frame.id);
+        let Some((_, state)) = self.frame_surfaces.get(&key) else {
+            return panel.into_any_element();
+        };
+        let mut controls =
+            layout! { H[g1] {} }.child(div().text_xs().child(frame.component.clone()));
+        for (name, label, input) in [
+            ("focus", "Focus", None),
+            (
+                "small",
+                "Compact",
+                Some(crate::frame::Input::Resize { w: 80, h: 16 }),
+            ),
+            (
+                "large",
+                "Expand",
+                Some(crate::frame::Input::Resize { w: 120, h: 40 }),
+            ),
+            (
+                "scroll-up",
+                "↑",
+                Some(crate::frame::Input::Mouse {
+                    kind: "scroll_up".into(),
+                    x: frame.w / 2,
+                    y: frame.h / 2,
+                }),
+            ),
+            (
+                "scroll-down",
+                "↓",
+                Some(crate::frame::Input::Mouse {
+                    kind: "scroll_down".into(),
+                    x: frame.w / 2,
+                    y: frame.h / 2,
+                }),
+            ),
+            ("close", "Close", Some(crate::frame::Input::Close)),
+        ] {
+            let request = input.map(|input| Command::FrameControl {
+                session_id: session.id.clone(),
+                generation: session.generation,
+                request: crate::frame::Request {
+                    id: frame.id.clone(),
+                    input,
+                },
+            });
+            let focus = state.clone();
+            let viewport_key = key.clone();
+            controls = controls.child(
+                Button::new(format!("frame-{name}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(!self.connected || self.remote_read_only(&session.id))
+                    .on_click(click(cx, move |view, window, cx| {
+                        if name == "large" {
+                            view.frame_expanded.insert(viewport_key.clone());
+                        }
+                        if name == "small" {
+                            view.frame_expanded.remove(&viewport_key);
+                        }
+                        if let Some(command) = &request {
+                            view.command(command.clone());
+                        } else {
+                            focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        panel = panel
+            .child(controls)
+            .child(self.frame_text_input(session, frame, cx));
+        let weak = cx.entity().downgrade();
+        let frame = frame.clone();
+        let session_id = session.id.clone();
+        let generation = session.generation;
+        let raw_frame = frame.clone();
+        let wheel_frame = frame.clone();
+        let key_input = key.clone();
+        let wheel_key = key.clone();
+        let key_owner = session_id.clone();
+        let wheel_owner = session_id.clone();
+        let key_view = weak.clone();
+        let wheel_view = weak.clone();
+        let height = if self.frame_expanded.contains(&key) {
+            400.0
+        } else {
+            160.0
+        };
+        let surface = gpui_ui_kit::scene2d::GameSurface::from_state(key, state.clone())
+            .aria_label("Interactive Plank frame")
+            .on_input(move |event, _, cx| {
+                if let Some(input) = crate::frame_view::input(&frame, event) {
+                    let _ = weak.update(cx, |view, _| {
+                        if let crate::frame::Input::Mouse { x, y, .. } = &input {
+                            view.frame_cursors.insert(key_input.clone(), (*x, *y));
+                        }
+                        view.command(Command::FrameControl {
+                            session_id: session_id.clone(),
+                            generation,
+                            request: crate::frame::Request {
+                                id: frame.id.clone(),
+                                input,
+                            },
+                        })
+                    });
+                }
+            });
+        let surface = div()
+            .h(gpui::px(height))
+            .w_full()
+            .child(surface)
+            .on_key_down(move |event, _, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if modifiers.platform {
+                    return;
+                }
+                use gpui_ui_kit::scene2d::{Scene2DInput, Scene2DKeyPhase, Scene2DModifier};
+                let mut flags = Vec::new();
+                if modifiers.control {
+                    flags.push(Scene2DModifier::Control);
+                }
+                if modifiers.alt {
+                    flags.push(Scene2DModifier::Alt);
+                }
+                if modifiers.shift {
+                    flags.push(Scene2DModifier::Shift);
+                }
+                if let Some(mut input) = crate::frame_view::input(
+                    &raw_frame,
+                    Scene2DInput::Key {
+                        phase: Scene2DKeyPhase::Down,
+                        key: event.keystroke.key.clone(),
+                        repeat: event.is_held,
+                        modifiers: flags,
+                        timestamp_ns: 0,
+                    },
+                ) {
+                    if !modifiers.control
+                        && !modifiers.alt
+                        && let Some(text) = event.keystroke.key_char.as_ref()
+                        && let Some(character) = text.chars().next().filter(|c| !c.is_control())
+                        && let crate::frame::Input::Key { text, .. } = &mut input
+                    {
+                        *text = Some(character);
+                    }
+                    let _ = key_view.update(cx, |view, _| {
+                        view.command(Command::FrameControl {
+                            session_id: key_owner.clone(),
+                            generation,
+                            request: crate::frame::Request {
+                                id: raw_frame.id.clone(),
+                                input,
+                            },
+                        })
+                    });
+                    cx.stop_propagation();
+                }
+            })
+            .on_scroll_wheel(move |event, _, cx| {
+                let delta: f32 = match event.delta {
+                    gpui::ScrollDelta::Pixels(point) => point.y.into(),
+                    gpui::ScrollDelta::Lines(point) => point.y,
+                };
+                if delta == 0.0 {
+                    return;
+                }
+                let _ = wheel_view.update(cx, |view, _| {
+                    let (x, y) = view
+                        .frame_cursors
+                        .get(&wheel_key)
+                        .copied()
+                        .unwrap_or((0, 0));
+                    view.command(Command::FrameControl {
+                        session_id: wheel_owner.clone(),
+                        generation,
+                        request: crate::frame::Request {
+                            id: wheel_frame.id.clone(),
+                            input: crate::frame::Input::Mouse {
+                                kind: if delta > 0.0 {
+                                    "scroll_up"
+                                } else {
+                                    "scroll_down"
+                                }
+                                .into(),
+                                x,
+                                y,
+                            },
+                        },
+                    });
+                });
+                cx.stop_propagation();
+            });
+        panel.child(surface).into_any_element()
+    }
+
+    fn frame_text_input(
+        &self,
+        session: &Session,
+        frame: &crate::frame::Snapshot,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        if !session.controls.as_ref().is_some_and(|controls| {
+            controls
+                .features
+                .iter()
+                .any(|feature| feature.name == "frame_text" && feature.available)
+        }) {
+            return div().into_any_element();
+        }
+        let key = format!(
+            "frame-text:{}",
+            export_key(&session.id, session.generation, &frame.id)
+        );
+        let open_key = format!("{key}:open");
+        let open = self
+            .fields
+            .get(&open_key)
+            .is_some_and(|value| value == "true");
+        let toggle_key = open_key.clone();
+        let disabled = !self.connected || self.remote_read_only(&session.id);
+        let mut row = div().flex().flex_wrap().items_center().gap_1().child(
+            Button::new(
+                "frame-text-toggle",
+                if open {
+                    "Hide text input"
+                } else {
+                    "Text input"
+                },
+            )
+            .size(ButtonSize::Xs)
+            .variant(ButtonVariant::Ghost)
+            .disabled(disabled)
+            .on_click(click(cx, move |view, window, cx| {
+                view.fields.insert(toggle_key.clone(), (!open).to_string());
+                if !open {
+                    view.frame_text_focus.focus(window, cx);
+                }
+                cx.notify();
+            })),
+        );
+        if !open {
+            return row.into_any_element();
+        }
+        let text = self.field(&key);
+        let weak = cx.entity().downgrade();
+        let edit_key = key.clone();
+        row = row.child(
+            div().w(px(220.0)).child(
+                Input::new(SharedString::from(key.clone()))
+                    .size(gpui_ui_kit::InputSize::Sm)
+                    .value(text.clone())
+                    .focus_handle(self.frame_text_focus.clone())
+                    .placeholder("Unicode text · up to 128 characters")
+                    .disabled(disabled)
+                    .on_text_change(move |text, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.fields.insert(edit_key.clone(), text.into());
+                            cx.notify();
+                        });
+                    }),
+            ),
+        );
+        for (name, label, input) in [
+            ("insert", "Insert", crate::frame::Input::Text { text }),
+            (
+                "enter",
+                "Enter",
+                crate::frame::Input::Key {
+                    code: "enter".into(),
+                    text: None,
+                },
+            ),
+            (
+                "backspace",
+                "⌫",
+                crate::frame::Input::Key {
+                    code: "backspace".into(),
+                    text: None,
+                },
+            ),
+        ] {
+            let request = crate::frame::Request {
+                id: frame.id.clone(),
+                input,
+            };
+            let owner = session.id.clone();
+            let generation = session.generation;
+            let key = key.clone();
+            row = row.child(
+                Button::new(format!("frame-text-{name}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(disabled || !request.is_valid())
+                    .on_click(click(cx, move |view, window, cx| {
+                        view.command(Command::FrameControl {
+                            session_id: owner.clone(),
+                            generation,
+                            request: request.clone(),
+                        });
+                        if name == "insert" {
+                            view.fields.remove(&key);
+                        }
+                        view.frame_text_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn artifacts_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        // Eight rows bound widget count; the existing activity surface stays compact.
+        const PAGE_FILES: usize = 8;
+        let mut panel = div()
+            .id("artifact-inventory")
+            .max_h(px(160.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs();
+        let Some(telemetry) = self.snapshot.telemetry.get(&session.id) else {
+            return panel
+                .child("No verified files. Use /export, /insights or /open an HTML file.")
+                .into_any_element();
+        };
+        let files = telemetry.available_artifacts();
+        if files.is_empty() {
+            return panel
+                .child("No verified files. Use /export, /insights or /open an HTML file.")
+                .into_any_element();
+        }
+        let page_key = format!("artifacts:{}:{}", session.id, session.generation);
+        let pages = files.len().div_ceil(PAGE_FILES);
+        let page = self
+            .field(&page_key)
+            .parse::<usize>()
+            .unwrap_or(0)
+            .min(pages - 1);
+        let mut actions = div().flex().items_center().gap_1().child(format!(
+            "{} files · newest first · {}/{}",
+            files.len(),
+            page + 1,
+            pages
+        ));
+        for (label, destination, disabled) in [
+            ("‹", page.saturating_sub(1), page == 0),
+            ("›", page + 1, page + 1 == pages),
+        ] {
+            let key = page_key.clone();
+            actions = actions.child(
+                Button::new(format!("artifact-page-{label}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(disabled)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields.insert(key.clone(), destination.to_string());
+                        cx.notify();
+                    })),
+            );
+        }
+        panel = panel.child(actions);
+        for export in files.into_iter().skip(page * PAGE_FILES).take(PAGE_FILES) {
+            let category = match export.purpose {
+                crate::model::ExportPurpose::Conversation => "Conversation",
+                crate::model::ExportPurpose::Insights => "Report",
+                crate::model::ExportPurpose::Preview => "Preview",
+            };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_size(px(10.0)).child(category))
+                    .child(self.export_download_row(session, export, cx)),
+            );
+        }
+        panel = panel.child(div().text_size(px(10.0)).child(
+            "History: 128 files / 512 MiB; newest file retained. Clears on reset or daemon exit.",
+        ));
+        if telemetry.artifacts_retired > 0 {
+            panel = panel.child(format!(
+                "{} older files retired by the history limit.",
+                telemetry.artifacts_retired
+            ));
+        }
+        panel.into_any_element()
+    }
+
     fn export_download_row(
         &self,
         session: &Session,
@@ -3108,43 +5456,93 @@ impl WorkspaceView {
         #[cfg(not(target_family = "wasm"))]
         let ready = false;
         let click_key = key.clone();
-        panel = panel.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .text_xs()
-                .child(format!("{} · {} bytes", export.name, export.bytes))
-                .child(
-                    Button::new(
-                        "current-export-download",
-                        if busy {
-                            "Downloading…"
-                        } else if ready {
-                            "Save file"
-                        } else {
-                            "Download"
-                        },
-                    )
-                    .size(ButtonSize::Xs)
-                    .variant(ButtonVariant::Ghost)
-                    .disabled(busy || !self.connected)
-                    .on_click(click(cx, move |view, _, cx| {
-                        #[cfg(target_family = "wasm")]
-                        if let Some((url, name)) = view.browser_exports.get(&click_key) {
-                            if let Err(error) = crate::web::save_file(url, name) {
-                                view.export_feedback = Some((click_key.clone(), error.to_string()));
-                            }
-                            cx.notify();
-                            return;
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(format!("{} · {} bytes", export.name, export.bytes))
+            .child(
+                Button::new(
+                    format!("export-download-{}", export.id),
+                    if busy {
+                        "Downloading…"
+                    } else if ready {
+                        "Save file"
+                    } else {
+                        "Download"
+                    },
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(busy || !self.connected)
+                .on_click(click(cx, move |view, _, cx| {
+                    #[cfg(target_family = "wasm")]
+                    if let Some((url, name)) = view.browser_exports.get(&click_key) {
+                        if let Err(error) = crate::web::save_file(url, name) {
+                            view.export_feedback = Some((click_key.clone(), error.to_string()));
                         }
+                        cx.notify();
+                        return;
+                    }
+                    #[cfg(not(target_family = "wasm"))]
+                    let _ = &click_key;
+                    view.download_export(id.clone(), generation, artifact.clone(), cx);
+                })),
+            );
+        if export.format == "html" {
+            let ready = self.preview_urls.contains_key(&key);
+            let preview_key = key.clone();
+            let request = ExportPreview {
+                key: key.clone(),
+                session: session.id.clone(),
+                generation: session.generation,
+                export: export.clone(),
+            };
+            row = row.child(
+                Button::new(
+                    format!("export-preview-{}", export.id),
+                    if ready { "Open preview" } else { "Preview" },
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(
+                    busy || !self.connected
+                        || (!ready && !self.export_jobs.is_empty())
+                        || export.bytes > crate::preview::MAX_BYTES,
+                )
+                .on_click(click(cx, move |view, _, cx| {
+                    if let Some(url) = view.preview_urls.get(&preview_key) {
                         #[cfg(not(target_family = "wasm"))]
-                        let _ = &click_key;
-                        view.download_export(id.clone(), generation, artifact.clone(), cx);
-                    })),
-                ),
-        );
+                        cx.open_url(url);
+                        #[cfg(target_family = "wasm")]
+                        if let Err(error) = crate::web::open_preview(url) {
+                            view.export_feedback = Some((preview_key.clone(), error.to_string()));
+                        }
+                    } else if view.export_jobs.is_empty() {
+                        view.export_jobs.insert(preview_key.clone());
+                        view.export_feedback = None;
+                        if view
+                            .tx
+                            .send(Operation::Preview(ExportPreview {
+                                key: request.key.clone(),
+                                session: request.session.clone(),
+                                generation: request.generation,
+                                export: request.export.clone(),
+                            }))
+                            .is_err()
+                        {
+                            view.export_jobs.remove(&preview_key);
+                            view.export_feedback =
+                                Some((preview_key.clone(), "Download worker stopped".into()));
+                        }
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        panel = panel.child(row);
         if let Some((id, message)) = &self.export_feedback
             && id == &key
         {
@@ -3181,8 +5579,22 @@ impl WorkspaceView {
                     .variant(ButtonVariant::Ghost)
                     .disabled(!supported || self.remote_read_only(&session.id))
                     .on_click(click(cx, move |view, window, cx| {
-                        view.prepare_command(command, args, cx);
-                        view.composer_focus.focus(window, cx);
+                        match id {
+                            "current-rename" => view.open_conversation_form(
+                                crate::commands::ConversationEdit::Rename,
+                                window,
+                                cx,
+                            ),
+                            "current-tag" => view.open_conversation_form(
+                                crate::commands::ConversationEdit::Tag,
+                                window,
+                                cx,
+                            ),
+                            _ => {
+                                view.prepare_command(command, args, cx);
+                                view.composer_focus.focus(window, cx);
+                            }
+                        }
                         cx.notify();
                     })),
             );
@@ -3193,6 +5605,15 @@ impl WorkspaceView {
             .telemetry
             .get(&session.id)
             .and_then(|telemetry| telemetry.export.as_ref())
+            && export.is_valid()
+        {
+            panel = panel.child(self.export_download_row(session, export, cx));
+        }
+        if let Some(export) = self
+            .snapshot
+            .telemetry
+            .get(&session.id)
+            .and_then(|telemetry| telemetry.preview_export.as_ref())
             && export.is_valid()
         {
             panel = panel.child(self.export_download_row(session, export, cx));
@@ -3212,13 +5633,24 @@ impl WorkspaceView {
                     .variant(ButtonVariant::Ghost)
                     .disabled(!supported || self.remote_read_only(&session.id))
                     .on_click(click(cx, move |view, window, cx| {
-                        view.prepare_command(command, true, cx);
-                        view.composer_focus.focus(window, cx);
+                        view.open_conversation_form(
+                            if command == "/rate +" {
+                                crate::commands::ConversationEdit::RatePositive
+                            } else {
+                                crate::commands::ConversationEdit::RateNegative
+                            },
+                            window,
+                            cx,
+                        );
                         cx.notify();
                     })),
             );
         }
         panel.child(ratings)
+            .child(if matches!(self.conversation_form, Some(crate::commands::ConversationEdit::Rename | crate::commands::ConversationEdit::Tag
+                | crate::commands::ConversationEdit::RatePositive | crate::commands::ConversationEdit::RateNegative)) {
+                self.conversation_form_panel(session, cx)
+            } else { div().into_any_element() })
             .child("Rename keeps the old saved copy. Exports are written on the engine host; received exports also offer a client download.")
             .into_any_element()
     }
@@ -3406,6 +5838,13 @@ impl WorkspaceView {
             .get(&session.id)
             .and_then(|telemetry| telemetry.host.as_ref());
         let remote_session = matches!(session.backend, Backend::Remote { .. });
+        let can_start = !remote_session
+            && session.controls.as_ref().is_some_and(|controls| {
+                controls
+                    .features
+                    .iter()
+                    .any(|feature| feature.name == "console_host" && feature.available)
+            });
         let mut actions = div().flex().flex_wrap().gap_1();
         let access = self
             .snapshot
@@ -3436,7 +5875,13 @@ impl WorkspaceView {
                         session_id: session.id.clone(),
                         request: false,
                     },
-                    access.is_none_or(|access| !access.controller) || session.state.busy(),
+                    access.is_none_or(|access| !access.controller)
+                        || (session.state.busy()
+                            && self
+                                .snapshot
+                                .telemetry
+                                .get(&session.id)
+                                .is_none_or(|value| value.frame.is_none())),
                 ),
             ] {
                 actions = actions.child(
@@ -3457,19 +5902,14 @@ impl WorkspaceView {
                 "host-auto",
                 "Start · automatic grants",
                 "/rc on",
-                !remote_session,
+                !can_start,
             ),
-            (
-                "host-ask",
-                "Start · require grants",
-                "/rc ask",
-                !remote_session,
-            ),
+            ("host-ask", "Start · require grants", "/rc ask", !can_start),
             (
                 "host-off",
                 "Stop host",
                 "/rc off",
-                !remote_session || snapshot.is_some_and(|host| host.holder == "off"),
+                snapshot.is_none_or(|host| host.holder == "off"),
             ),
             (
                 "host-grant",
@@ -3516,8 +5956,8 @@ impl WorkspaceView {
                 panel = panel.child(reason.clone());
             }
         }
-        if !remote_session {
-            panel = panel.child("Local GUI hosting needs the console bridge. Existing remote Plank hosts can be managed here.");
+        if !remote_session && !can_start {
+            panel = panel.child("This engine does not advertise graphical remote hosting.");
         }
         if let Some(host) = snapshot {
             if let Some(endpoint) = &host.endpoint {
@@ -3620,7 +6060,13 @@ impl WorkspaceView {
                 "engine-inventory-choose",
                 "Choose…",
                 "/engines",
-                !matches!(session.backend, Backend::Local { .. })
+                !(matches!(session.backend, Backend::Local { .. })
+                    || matches!(session.backend, Backend::Remote { .. })
+                        && session.controls.as_ref().is_some_and(|controls| {
+                            controls.features.iter().any(|feature| {
+                                feature.name == "remote_restart" && feature.available
+                            })
+                        }))
                     || self.remote_read_only(&session.id),
             ),
         ] {
@@ -3708,7 +6154,7 @@ impl WorkspaceView {
                     .child(engine.notes.clone()),
             );
         }
-        panel.child("Snapshot at request time. Choose opens the local engine chooser after Send; remote restart is not available yet.").into_any_element()
+        panel.child("Snapshot at request time. Choose opens the host's engine chooser after Send. Remote switching requires host support; after reconnecting, request control to answer startup choices.").into_any_element()
     }
 
     fn metrics_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
@@ -3795,11 +6241,47 @@ impl WorkspaceView {
             .get(&session.id)
             .and_then(|telemetry| telemetry.metrics.get(self.metrics_kind));
         match snapshot {
-            Some(EngineMetrics::Insights { markdown, .. }) => {
-                panel = panel.child(self.insights_report(markdown, cx));
+            Some(EngineMetrics::Insights {
+                markdown, charts, ..
+            }) => {
+                if !charts.is_empty() {
+                    let mut views = div().flex().gap_1();
+                    for (mode, label) in [("charts", "Charts"), ("report", "Text report")] {
+                        let selected = self
+                            .fields
+                            .get("insights-view")
+                            .map_or("charts", String::as_str);
+                        views = views.child(
+                            Button::new(format!("insights-view-{mode}"), label)
+                                .size(ButtonSize::Xs)
+                                .variant(if selected == mode {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Ghost
+                                })
+                                .on_click(click(cx, move |view, _, cx| {
+                                    view.fields.insert("insights-view".into(), mode.into());
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    panel = panel.child(views);
+                }
+                panel = if !charts.is_empty()
+                    && self
+                        .fields
+                        .get("insights-view")
+                        .is_none_or(|mode| mode != "report")
+                {
+                    panel.child(self.insights_chart(charts, cx))
+                } else {
+                    panel.child(self.insights_report(markdown, cx))
+                };
             }
             Some(EngineMetrics::Engines { .. }) => {}
             Some(EngineMetrics::Subagents { .. }) => {}
+            Some(EngineMetrics::SubagentHistory { .. }) => {}
+            Some(EngineMetrics::JobOutput { .. }) => {}
             Some(EngineMetrics::Activity { snapshot }) => {
                 let mut scopes = div().flex().gap_1();
                 for (scope, label) in [("all", "All time"), ("7", "7 days"), ("30", "30 days")] {
@@ -4017,6 +6499,83 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn insights_chart(
+        &self,
+        charts: &[crate::insightchart::Chart],
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let index = self
+            .fields
+            .get("insights-chart")
+            .and_then(|index| index.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(charts.len().saturating_sub(1));
+        let Some(chart) = charts.get(index) else {
+            return div().into_any_element();
+        };
+        let mut navigation = div().flex().items_center().gap_1();
+        for (id, label, target, disabled) in [
+            (
+                "insights-chart-previous",
+                "‹",
+                index.saturating_sub(1),
+                index == 0,
+            ),
+            (
+                "insights-chart-next",
+                "›",
+                index + 1,
+                index + 1 >= charts.len(),
+            ),
+        ] {
+            navigation = navigation.child(
+                Button::new(id, label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(disabled)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields
+                            .insert("insights-chart".into(), target.to_string());
+                        cx.notify();
+                    })),
+            );
+        }
+        navigation = navigation.child(format!(
+            "{} · {}/{}",
+            chart.kind.title(),
+            index + 1,
+            charts.len()
+        ));
+        let mut panel = div().flex().flex_col().gap_1().child(navigation);
+        let scale = chart.scale();
+        for (label, value) in &chart.rows {
+            let measurement = if chart.kind.percent() {
+                format!("{value:.1}%")
+            } else {
+                format!("{value:.0}")
+            };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(label.clone()))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Progress::new((value / scale) as f32)
+                                .size(ProgressSize::Xs)
+                                .aria_label(format!("{label}: {measurement}")),
+                        ),
+                    )
+                    .child(div().w(px(64.0)).flex_shrink_0().child(measurement)),
+            );
+        }
+        if !chart.note.is_empty() {
+            panel = panel.child(chart.note.clone());
+        }
+        panel.into_any_element()
+    }
+
     fn insights_report(&self, source: &str, cx: &Context<Self>) -> gpui::AnyElement {
         let colors = WorkspaceTheme::from(cx.theme().as_ref());
         let mut report = div().flex().flex_col().gap_1().text_xs();
@@ -4102,7 +6661,7 @@ impl WorkspaceView {
                 Button::new(id, label)
                     .size(ButtonSize::Xs)
                     .variant(ButtonVariant::Ghost)
-                    .disabled(disabled)
+                    .disabled(disabled || snapshot.is_some_and(|snapshot| snapshot.foreground))
                     .on_click(click(cx, move |view, window, cx| {
                         view.prepare_command(command, false, cx);
                         view.composer_focus.focus(window, cx);
@@ -4110,7 +6669,9 @@ impl WorkspaceView {
                     })),
             );
         }
-        panel = panel.child(actions);
+        if !snapshot.is_some_and(|snapshot| snapshot.foreground) {
+            panel = panel.child(actions);
+        }
         if let Some(progress) = &session.progress {
             panel = panel.child(format!("Engine setup · {}", progress.label));
             if progress.total > 0 {
@@ -4139,10 +6700,11 @@ impl WorkspaceView {
                 _ => "Unrecognized helper state",
             };
             panel = panel
-                .child(format!(
-                    "{} · manifest {} · {phase}",
-                    state.set, state.version
-                ))
+                .child(if snapshot.foreground {
+                    format!("{} · {phase} · cancel in the download dialog", state.set)
+                } else {
+                    format!("{} · manifest {} · {phase}", state.set, state.version)
+                })
                 .child(format!(
                     "{} · artifact {}/{}",
                     state.current, state.index, state.of
@@ -4194,10 +6756,39 @@ impl WorkspaceView {
     }
 
     fn jobs_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let output = self
+            .fields
+            .get("jobs-output-view")
+            .is_some_and(|value| value == "true");
+        let mut tabs = div().flex().gap_1();
+        for (label, selected) in [("Jobs", false), ("Output", true)] {
+            tabs = tabs.child(
+                Button::new(format!("jobs-view-{label}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(if output == selected {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields
+                            .insert("jobs-output-view".into(), selected.to_string());
+                        cx.notify();
+                    })),
+            );
+        }
+        if output {
+            return div()
+                .id("job-output-surface")
+                .h(px(160.0))
+                .flex()
+                .flex_col()
+                .child(tabs)
+                .child(self.job_output_panel(session, cx))
+                .into_any_element();
+        }
         let mut rows = div()
             .id("engine-jobs")
-            .max_h(px(160.0))
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_1()
@@ -4223,7 +6814,17 @@ impl WorkspaceView {
                     });
                     let mut actions = div().flex().gap_1();
                     for (action, label) in [("output", "Output"), ("stop", "Stop")] {
-                        let command = format!("/jobs {action} {}", job.id);
+                        let paged = action == "output"
+                            && session.controls.as_ref().is_some_and(|controls| {
+                                controls.features.iter().any(|feature| {
+                                    feature.name == "job_output_pages" && feature.available
+                                })
+                            });
+                        let command = format!(
+                            "/jobs {action} {}{}",
+                            job.id,
+                            if paged { " --page 1" } else { "" }
+                        );
                         actions = actions.child(
                             Button::new(format!("job-{action}-{}", job.id), label)
                                 .size(ButtonSize::Xs)
@@ -4271,6 +6872,10 @@ impl WorkspaceView {
             ),
         }
         div()
+            .id("job-controls")
+            .max_h(px(160.0))
+            .overflow_y_scroll()
+            .child(tabs)
             .child(rows)
             .child(
                 Button::new("jobs-report", "Report")
@@ -4284,6 +6889,281 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn output_stop_command(&self, session: &Session) -> Option<Command> {
+        if !self.connected
+            || self.remote_read_only(&session.id)
+            || session.archived
+            || session.recovery_required
+            || !session.controls.as_ref().is_some_and(|controls| {
+                controls
+                    .features
+                    .iter()
+                    .any(|feature| feature.name == "job_output_cancel" && feature.available)
+            })
+        {
+            return None;
+        }
+        let crate::model::EngineMetrics::JobOutput { snapshot } = self
+            .snapshot
+            .telemetry
+            .get(&session.id)?
+            .metrics
+            .get("job_output")?
+        else {
+            return None;
+        };
+        if !snapshot.following {
+            return None;
+        }
+        Some(Command::StopJobOutput {
+            session_id: session.id.clone(),
+            generation: session.generation,
+            observer: snapshot.observer.clone()?,
+        })
+    }
+
+    fn job_output_panel(&self, session: &Session, cx: &Context<Self>) -> gpui::AnyElement {
+        let snapshot = self
+            .snapshot
+            .telemetry
+            .get(&session.id)
+            .and_then(|telemetry| telemetry.metrics.get("job_output"))
+            .and_then(|metrics| match metrics {
+                crate::model::EngineMetrics::JobOutput { snapshot } => Some(snapshot),
+                _ => None,
+            });
+        let Some(snapshot) = snapshot else {
+            return div()
+                .text_xs()
+                .child("Select Output on a tracked job to request a page.")
+                .into_any_element();
+        };
+        let pages = snapshot.total.div_ceil(crate::joboutput::PAGE_BYTES).max(1);
+        if snapshot.following {
+            self.job_output_scroll.scroll_to_bottom();
+        }
+        let supported = session.controls.as_ref().is_some_and(|controls| {
+            controls
+                .features
+                .iter()
+                .any(|feature| feature.name == "job_output_pages" && feature.available)
+        });
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(format!("#{} · {}/{}", snapshot.id, snapshot.page, pages));
+        for (label, page, disabled) in [
+            (
+                "‹",
+                snapshot.page.saturating_sub(1).max(1),
+                snapshot.page <= 1,
+            ),
+            ("›", snapshot.page.saturating_add(1), snapshot.page >= pages),
+            ("Refresh", snapshot.page, false),
+            ("Last", u64::MAX, false),
+        ] {
+            let command = format!("/jobs output {} --page {page}", snapshot.id);
+            actions = actions.child(
+                Button::new(format!("job-output-{label}"), label)
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(disabled || !supported || self.remote_read_only(&session.id))
+                    .on_click(click(cx, move |view, window, cx| {
+                        view.prepare_command(&command, false, cx);
+                        view.composer_focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        let copied = snapshot.text.clone();
+        if session.controls.as_ref().is_some_and(|controls| {
+            controls
+                .features
+                .iter()
+                .any(|feature| feature.name == "job_output_follow" && feature.available)
+        }) {
+            let command = if snapshot.following {
+                "/jobs unfollow".into()
+            } else {
+                format!("/jobs follow {}", snapshot.id)
+            };
+            let cancellation = self.output_stop_command(session);
+            actions = actions.child(
+                Button::new(
+                    "job-output-follow",
+                    if snapshot.following {
+                        "Stop follow"
+                    } else {
+                        "Follow"
+                    },
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .disabled(self.remote_read_only(&session.id))
+                .on_click(click(cx, move |view, window, cx| {
+                    if let Some(cancellation) = &cancellation {
+                        view.command(cancellation.clone());
+                    } else {
+                        view.prepare_command(&command, false, cx);
+                        view.composer_focus.focus(window, cx);
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        actions = actions.child(
+            Button::new("job-output-copy", "Copy page")
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                })),
+        );
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .text_xs()
+            .child(actions)
+            .child(format!(
+                "Bytes {}–{} of {} · {}",
+                snapshot.start,
+                snapshot.end,
+                snapshot.total,
+                if snapshot.following {
+                    "live tail · 1s"
+                } else {
+                    "snapshot"
+                }
+            ));
+        if snapshot.lossy {
+            panel = panel.child("Invalid UTF-8 bytes are shown as replacement characters.");
+        }
+        panel
+            .child(
+                div()
+                    .id("job-output-text")
+                    .track_scroll(&self.job_output_scroll)
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(snapshot.text.clone()),
+            )
+            .into_any_element()
+    }
+
+    fn document_selection_key(
+        &mut self,
+        key: &str,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::document::Movement;
+        let Some(document) = self.documents.get_mut(key) else {
+            return false;
+        };
+        let focused = document
+            .lines
+            .iter()
+            .skip(document.page * crate::document::PAGE_LINES)
+            .take(crate::document::PAGE_LINES)
+            .find_map(|line| {
+                crate::editor_input::Input::focused_selection(
+                    SharedString::from(format!("document-line-{}", line.id)),
+                    window,
+                )
+                .map(|selection| (line.id.clone(), selection))
+            });
+        let Some((line_id, native_selection)) = focused else {
+            return false;
+        };
+        if native_selection.composing {
+            return true;
+        }
+        if document.selection.is_none() {
+            document.observe_selection(
+                &line_id,
+                native_selection.start,
+                native_selection.end,
+                native_selection.reversed,
+            );
+        }
+        let modifiers = event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        let shortcut = (modifiers.platform || modifiers.control) && !modifiers.alt;
+        let cross = document.crosses_lines();
+        let selected = document
+            .selection
+            .is_some_and(|selection| selection.anchor != selection.head);
+        if shortcut {
+            match key {
+                "a" if modifiers.platform || !cfg!(target_os = "macos") => document.select_all(),
+                "c" | "x" if selected => {
+                    if let Some(text) = document.selected_text() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        if key == "x" {
+                            document.replace_selection("");
+                            self.draft_dirty = true;
+                        }
+                    }
+                }
+                "v" if selected => {
+                    if let Some(item) = cx.read_from_clipboard()
+                        && let Some(text) = item.text()
+                    {
+                        document.replace_selection(&text);
+                        self.draft_dirty = true;
+                    }
+                }
+                _ => return false,
+            }
+        } else if !modifiers.alt {
+            let movement = match key {
+                "up" => Some(Movement::Up),
+                "down" => Some(Movement::Down),
+                "left" if modifiers.shift || selected => Some(Movement::Left),
+                "right" if modifiers.shift || selected => Some(Movement::Right),
+                "home" if modifiers.shift || selected => Some(Movement::Start),
+                "end" if modifiers.shift || selected => Some(Movement::End),
+                _ => None,
+            };
+            if let Some(movement) = movement {
+                document.move_cursor(movement, modifiers.shift);
+            } else {
+                let replacement = match key {
+                    "backspace" | "delete" if selected => Some(""),
+                    "enter" => Some("\n"),
+                    "tab" if !modifiers.shift => Some("\t"),
+                    "escape" if cross => {
+                        if let Some(selection) = &mut document.selection {
+                            selection.anchor = selection.head;
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                    "space" if selected => Some(" "),
+                    _ if selected => event.keystroke.key_char.as_deref(),
+                    _ => None,
+                };
+                let Some(text) = replacement else {
+                    return false;
+                };
+                if !document.replace_selection(text) {
+                    return false;
+                }
+                self.draft_dirty = true;
+            }
+        } else {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     fn document_editor(
         &self,
         session_id: &str,
@@ -4293,7 +7173,43 @@ impl WorkspaceView {
         let colors = WorkspaceTheme::from(cx.theme().as_ref());
         let key = document_key(session_id, editor);
         let Some(document) = self.documents.get(&key) else {
-            return div().into_any_element();
+            let error = self.document_errors.get(&key);
+            let retry_key = key.clone();
+            let id = session_id.to_owned();
+            let pending = editor.clone();
+            let mut panel = div().p_2().text_xs().child(editor.tool.clone()).child(
+                error.map_or("Loading document…".to_owned(), |error| {
+                    format!("Could not load document: {error}")
+                }),
+            );
+            if error.is_some() {
+                panel = panel.child(
+                    Button::new("retry-editor-load", "Retry")
+                        .size(ButtonSize::Xs)
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.document_errors.remove(&retry_key);
+                            view.request_document();
+                            cx.notify();
+                        })),
+                );
+            }
+            return panel
+                .child(
+                    Button::new("cancel-editor-load", "Cancel")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .disabled(self.remote_read_only(session_id))
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.command(Command::EditDocument {
+                                session_id: id.clone(),
+                                approval_id: pending.id.clone(),
+                                requirement: pending.requirement.clone(),
+                                text: None,
+                            });
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
         };
         let mut rows = div()
             .id("document-lines")
@@ -4322,10 +7238,31 @@ impl WorkspaceView {
             let weak = cx.entity().downgrade();
             let text_key = key.clone();
             let end_key = key.clone();
+            let end_id = id.clone();
+            let native_key = key.clone();
+            let native_id = id.clone();
+            let native_weak = cx.entity().downgrade();
+            let selection_key = key.clone();
+            let selection_id = id.clone();
+            let selection_weak = cx.entity().downgrade();
             let mut input =
                 crate::editor_input::Input::new(SharedString::from(format!("document-line-{id}")))
                     .size(crate::editor_input::InputSize::Sm)
                     .value(line.text.clone())
+                    .on_native_edit(move |edit, _, cx| {
+                        native_weak
+                            .update(cx, |view, cx| {
+                                let result = view
+                                    .documents
+                                    .get_mut(&native_key)?
+                                    .native_edit(&native_id, edit);
+                                view.draft_dirty = true;
+                                cx.notify();
+                                result
+                            })
+                            .ok()
+                            .flatten()
+                    })
                     .on_text_change(move |text, _, cx| {
                         let _ = weak.update(cx, |view, cx| {
                             if let Some(document) = view.documents.get_mut(&text_key) {
@@ -4335,11 +7272,37 @@ impl WorkspaceView {
                             cx.notify();
                         });
                     })
-                    .on_edit_end(document_edit_end(cx, end_key));
+                    .on_selection_change(move |selection, _, cx| {
+                        let _ = selection_weak.update(cx, |view, cx| {
+                            if let Some(document) = view.documents.get_mut(&selection_key) {
+                                if selection.extend_document {
+                                    document.extend_to(&selection_id, selection.end);
+                                } else {
+                                    document.observe_selection(
+                                        &selection_id,
+                                        selection.start,
+                                        selection.end,
+                                        selection.reversed,
+                                    );
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .document_selection(document.line_selection(index))
+                    .document_pointer(
+                        key.clone().into(),
+                        std::rc::Rc::clone(&self.document_pointer),
+                    )
+                    .on_edit_end(document_edit_end(cx, end_key, end_id));
             if let Some(navigation) = &document.navigation
                 && navigation.line_id == id
             {
-                input = input.navigate(navigation.token, navigation.range.clone());
+                input = input.navigate_native(
+                    navigation.token,
+                    navigation.range.clone(),
+                    navigation.marked.clone(),
+                );
             }
             let add_key = key.clone();
             let add_id = id.clone();
@@ -4433,19 +7396,48 @@ impl WorkspaceView {
             ("›", page + 1, page + 1 == pages),
         ] {
             let key = key.clone();
+            let page_key = key.clone();
+            let page_scope: SharedString = key.clone().into();
             actions = actions.child(
-                Button::new(SharedString::from(format!("editor-page-{label}")), label)
-                    .size(ButtonSize::Xs)
-                    .variant(ButtonVariant::Ghost)
-                    .disabled(disabled)
-                    .on_click(click(cx, move |view, _, cx| {
-                        if let Some(document) = view.documents.get_mut(&key) {
-                            document.end_typing();
-                            document.page = destination;
-                        }
-                        view.draft_dirty = true;
-                        cx.notify();
-                    })),
+                div()
+                    .on_mouse_move(
+                        cx.listener(move |view, event: &gpui::MouseMoveEvent, _, cx| {
+                            if !disabled
+                                && view.document_pointer.borrow_mut().turn_page(
+                                    &page_scope,
+                                    event.pressed_button == Some(gpui::MouseButton::Left),
+                                )
+                                && let Some(document) = view.documents.get_mut(&page_key)
+                                && document.page == page
+                                && destination < document.pages()
+                            {
+                                document.end_typing();
+                                document.navigation = None;
+                                document.page = destination;
+                                view.draft_dirty = true;
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("editor-page-{label}")), label)
+                            .aria_label(if label == "‹" {
+                                "Previous page; drag here to extend selection"
+                            } else {
+                                "Next page; drag here to extend selection"
+                            })
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(disabled)
+                            .on_click(click(cx, move |view, _, cx| {
+                                if let Some(document) = view.documents.get_mut(&key) {
+                                    document.end_typing();
+                                    document.page = destination;
+                                }
+                                view.draft_dirty = true;
+                                cx.notify();
+                            })),
+                    ),
             );
         }
         actions = actions.child(
@@ -4491,6 +7483,20 @@ impl WorkspaceView {
                         cx.notify();
                     })),
             );
+        let save_limit = crate::commands::editor_save_limit(
+            self.snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.controls.as_ref()),
+        );
+        let oversized = document.byte_len() > save_limit;
+        if oversized {
+            actions = actions.child(format!(
+                "Save limit: {} KiB · draft retained",
+                save_limit / 1024
+            ));
+        }
         for (label, save) in [("Save", true), ("Cancel", false)] {
             let id = session_id.to_owned();
             let approval_id = editor.id.clone();
@@ -4499,7 +7505,7 @@ impl WorkspaceView {
             actions = actions.child(
                 Button::new(SharedString::from(format!("document-{label}")), label)
                     .size(ButtonSize::Xs)
-                    .disabled(self.remote_read_only(session_id))
+                    .disabled(self.remote_read_only(session_id) || (save && oversized))
                     .variant(if save {
                         ButtonVariant::Primary
                     } else {
@@ -4528,6 +7534,11 @@ impl WorkspaceView {
             .id(SharedString::from(format!("document-editor-{key}")))
             .capture_key_down(
                 cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
+                    view.document_pointer.borrow_mut().finish();
+                    if view.document_selection_key(&history_key, event, window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     let modifiers = event.keystroke.modifiers;
                     #[cfg(target_os = "macos")]
                     let find_modifier = modifiers.platform;
@@ -4898,6 +7909,14 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_subscription.is_none() {
+            self.focus_active = window.is_window_active();
+            self.focus_subscription =
+                Some(cx.observe_window_activation(window, |view, window, _cx| {
+                    view.focus_active = window.is_window_active();
+                    view.publish_view_focus();
+                }));
+        }
         let mut visible_inputs = HashSet::new();
         if !self.appearance
             && let Some(session) = self.selected.as_ref().and_then(|id| {
@@ -5070,6 +8089,24 @@ impl Render for WorkspaceView {
                     .child(error.clone()),
             );
         }
+        #[cfg(target_family = "wasm")]
+        if let Some(error) = &self.preference_error {
+            root = root.child(
+                div()
+                    .p_3()
+                    .bg(colors.surface)
+                    .text_color(colors.accent)
+                    .child(error.clone())
+                    .child(
+                        Button::new("retry-preference-save", "Retry save")
+                            .size(ButtonSize::Xs)
+                            .on_click(click(cx, |view, _, cx| {
+                                view.save_preferences();
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         root = root.child(body).child(
             div()
                 .px_4()
@@ -5147,24 +8184,16 @@ fn export_key(session: &str, generation: u64, id: &str) -> String {
     format!("{session}:{generation}:{id}")
 }
 
-#[cfg(target_family = "wasm")]
 fn snapshot_has_export(snapshot: &Snapshot, key: &str) -> bool {
     snapshot.sessions.iter().any(|session| {
         snapshot
             .telemetry
             .get(&session.id)
             .is_some_and(|telemetry| {
-                [&telemetry.export, &telemetry.insights_export]
+                telemetry
+                    .available_artifacts()
                     .into_iter()
-                    .flatten()
-                    .any(|export| {
-                        export_key(&session.id, session.generation, &export.id) == key
-                            && (export.purpose != crate::model::ExportPurpose::Insights
-                                || telemetry
-                                    .metrics
-                                    .get("insights")
-                                    .is_none_or(|metrics| export.matches_insights(metrics)))
-                    })
+                    .any(|export| export_key(&session.id, session.generation, &export.id) == key)
             })
     })
 }
@@ -5172,12 +8201,13 @@ fn snapshot_has_export(snapshot: &Snapshot, key: &str) -> bool {
 fn document_edit_end(
     cx: &Context<WorkspaceView>,
     key: String,
+    line_id: String,
 ) -> impl Fn(Option<String>, &mut Window, &mut App) + 'static {
     let weak = cx.entity().downgrade();
     move |_, _, cx| {
         let _ = weak.update(cx, |view, _| {
             if let Some(document) = view.documents.get_mut(&key) {
-                document.end_typing();
+                document.native_edit_end(&line_id);
             }
         });
     }
@@ -5229,6 +8259,171 @@ fn design_name(index: usize) -> &'static str {
     ][index % 7]
 }
 
+/// Applies only the entries `current` changed relative to `base` onto the
+/// on-disk state, so concurrent windows keep each other's distinct drafts.
+/// Unchanged keys keep the disk value; keys removed since `base` are removed.
+#[cfg(not(target_family = "wasm"))]
+fn merge_preferences(
+    base: &Preferences,
+    current: &Preferences,
+    mut disk: Preferences,
+) -> Preferences {
+    fn merge_map<V: Clone + PartialEq>(
+        base: &HashMap<String, V>,
+        current: &HashMap<String, V>,
+        disk: &mut HashMap<String, V>,
+    ) {
+        for (key, value) in current {
+            if base.get(key) != Some(value) {
+                disk.insert(key.clone(), value.clone());
+            }
+        }
+        for key in base.keys() {
+            if !current.contains_key(key) {
+                disk.remove(key);
+            }
+        }
+    }
+    // Documents have no `PartialEq`; compare their serialized form instead.
+    let serialized = |map: &HashMap<String, crate::document::Document>| {
+        map.iter()
+            .map(|(key, doc)| (key.clone(), serde_json::to_string(doc).unwrap_or_default()))
+            .collect::<HashMap<_, _>>()
+    };
+    let base_docs = serialized(&base.documents);
+    let current_docs = serialized(&current.documents);
+    for key in current.documents.keys() {
+        if base_docs.get(key) != current_docs.get(key)
+            && let Some(doc) = current.documents.get(key)
+        {
+            disk.documents.insert(key.clone(), doc.clone());
+        }
+    }
+    for key in base.documents.keys() {
+        if !current.documents.contains_key(key) {
+            disk.documents.remove(key);
+        }
+    }
+    merge_map(&base.drafts, &current.drafts, &mut disk.drafts);
+    merge_map(
+        &base.pending_prompts,
+        &current.pending_prompts,
+        &mut disk.pending_prompts,
+    );
+    for key in &current.collapsed {
+        if !base.collapsed.contains(key) {
+            disk.collapsed.insert(key.clone());
+        }
+    }
+    for key in &base.collapsed {
+        if !current.collapsed.contains(key) {
+            disk.collapsed.remove(key);
+        }
+    }
+    if current.theme != base.theme {
+        disk.theme = current.theme;
+    }
+    if current.design != base.design {
+        disk.design = current.design;
+    }
+    if current.selected != base.selected {
+        disk.selected = current.selected.clone();
+    }
+    disk
+}
+
+#[cfg(all(not(target_family = "wasm"), test))]
+fn persist_preferences(
+    directory: &std::path::Path,
+    preferences: &Preferences,
+    appearance_only: bool,
+) -> anyhow::Result<()> {
+    persist_preferences_based(directory, preferences, appearance_only, None)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn persist_preferences_based(
+    directory: &std::path::Path,
+    preferences: &Preferences,
+    appearance_only: bool,
+    baseline: Option<&Preferences>,
+) -> anyhow::Result<()> {
+    use fs2::FileExt as _;
+    use std::io::Write;
+    std::fs::create_dir_all(directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("preferences.lock"))?;
+    lock.lock_exclusive()?;
+    let mut current;
+    let preferences = if appearance_only {
+        current = match std::fs::read(directory.join("preferences.json")) {
+            Ok(bytes) => serde_json::from_slice::<Preferences>(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
+            Err(error) => return Err(error.into()),
+        };
+        current.theme = preferences.theme;
+        current.design = preferences.design;
+        &current
+    } else if let Some(baseline) = baseline {
+        current = match std::fs::read(directory.join("preferences.json")) {
+            Ok(bytes) => serde_json::from_slice::<Preferences>(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
+            Err(error) => return Err(error.into()),
+        };
+        current = merge_preferences(baseline, preferences, current);
+        &current
+    } else {
+        preferences
+    };
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(&serde_json::to_vec(preferences)?)?;
+    file.as_file().sync_all()?;
+    file.persist(directory.join("preferences.json"))?;
+    Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+fn appearance_preferences(preferences: &Preferences) -> String {
+    serde_json::json!({"theme":preferences.theme,"design":preferences.design}).to_string()
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn restore_browser_preferences() -> anyhow::Result<Preferences> {
+    let (stored, appearance) = crate::browser_preferences::load()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let legacy = browser_preferences();
+    let raw = stored.as_ref().or(legacy.as_ref());
+    let mut preferences = raw
+        .map(|raw| serde_json::from_str::<Preferences>(raw))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(appearance) = appearance {
+        let appearance: Preferences = serde_json::from_str(&appearance)?;
+        preferences.theme = appearance.theme;
+        preferences.design = appearance.design;
+    }
+    let appearance = appearance_preferences(&preferences);
+    if stored.is_none()
+        && let Some(legacy) = legacy
+    {
+        crate::browser_preferences::store(Some(&legacy), &appearance)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+    // Retire legacy large localStorage data only after a successful DB commit.
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item("nplank.preferences", &appearance);
+    }
+    Ok(preferences)
+}
+
 fn load_preferences(directory: &std::path::Path) -> Preferences {
     #[cfg(not(target_family = "wasm"))]
     let bytes = std::fs::read(directory.join("preferences.json")).ok();
@@ -5252,6 +8447,7 @@ fn browser_preferences() -> Option<String> {
 fn bridge(
     client: Client,
     selected: Option<String>,
+    focus: Arc<Mutex<Option<Command>>>,
 ) -> (mpsc::Sender<Operation>, mpsc::Receiver<Update>) {
     let (tx, input) = mpsc::channel();
     let (output, rx) = mpsc::sync_channel(4);
@@ -5264,10 +8460,10 @@ fn bridge(
                 return;
             }
         };
-        runtime.block_on(run_bridge(client, selected, input, output));
+        runtime.block_on(run_bridge(client, selected, input, output, focus));
     });
     #[cfg(target_family = "wasm")]
-    wasm_bindgen_futures::spawn_local(run_bridge(client, selected, input, output));
+    wasm_bindgen_futures::spawn_local(run_bridge(client, selected, input, output, focus));
     (tx, rx)
 }
 
@@ -5276,15 +8472,34 @@ async fn run_bridge(
     mut selected: Option<String>,
     input: mpsc::Receiver<Operation>,
     output: mpsc::SyncSender<Update>,
+    focus: Arc<Mutex<Option<Command>>>,
 ) {
     let mut before = 0;
+    let mut aside_before = 0;
     loop {
+        // Coalesce presence: slow or disconnected networking must not queue old focus states.
+        let latest_focus = focus.lock().expect("focus presence poisoned").take();
+        if let Some(command) = latest_focus {
+            let _ = client.execute(&command).await;
+        }
+        let mut frame_result: Option<Result<(), String>> = None;
         loop {
             match input.try_recv() {
                 Ok(Operation::Select(id, page)) => {
+                    if selected != id {
+                        aside_before = 0;
+                    }
                     selected = id;
                     before = page;
                 }
+                Ok(Operation::AsidePage(page)) => {
+                    aside_before = page;
+                }
+                Ok(Operation::FrameControl(command)) => match client.execute(&command).await {
+                    Ok(_) if frame_result.is_none() => frame_result = Some(Ok(())),
+                    Err(error) => frame_result = Some(Err(error.to_string())),
+                    _ => {}
+                },
                 Ok(Operation::Command(command)) => {
                     let select = matches!(command, Command::CreateSession { .. });
                     let workspace = matches!(command, Command::CreateWorkspace { .. });
@@ -5303,6 +8518,32 @@ async fn run_bridge(
                     if !send_update(&output, update).await {
                         return;
                     }
+                }
+                Ok(Operation::LoadDocument(request, registration)) => {
+                    let client = client.clone();
+                    let output = output.clone();
+                    let load = async move {
+                        let fetch = async {
+                            client
+                                .load_document(&request.session, &request.editor)
+                                .await
+                                .map(|text| crate::document::Document::new(&text))
+                                .map_err(|error| error.to_string())
+                        };
+                        if let Ok(result) =
+                            futures_util::future::Abortable::new(fetch, registration).await
+                        {
+                            send_update(
+                                &output,
+                                Update::DocumentLoaded(Box::new((request, result))),
+                            )
+                            .await;
+                        }
+                    };
+                    #[cfg(not(target_family = "wasm"))]
+                    tokio::spawn(load);
+                    #[cfg(target_family = "wasm")]
+                    wasm_bindgen_futures::spawn_local(load);
                 }
                 Ok(Operation::Download(request)) => {
                     let client = client.clone();
@@ -5339,18 +8580,99 @@ async fn run_bridge(
                         send_update(&output, update).await;
                     });
                 }
+                Ok(Operation::Preview(request)) => {
+                    let client = client.clone();
+                    let output = output.clone();
+                    #[cfg(not(target_family = "wasm"))]
+                    tokio::spawn(async move {
+                        let result = async {
+                            anyhow::ensure!(
+                                request.export.format == "html"
+                                    && request.export.bytes <= crate::preview::MAX_BYTES,
+                                "Preview requires HTML of at most 32 MiB"
+                            );
+                            let directory = tempfile::tempdir()?;
+                            let source = directory.path().join("source.html");
+                            client
+                                .save_export(
+                                    &request.session,
+                                    request.generation,
+                                    &request.export,
+                                    &source,
+                                )
+                                .await?;
+                            let export = request.export;
+                            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                let html = std::fs::read_to_string(&source)?;
+                                let page = crate::preview::document(&export, &html)?;
+                                let path = directory.path().join("preview.html");
+                                std::fs::write(&path, page)?;
+                                std::fs::remove_file(source)?;
+                                let url = reqwest::Url::from_file_path(&path)
+                                    .map_err(|()| anyhow::anyhow!("Invalid preview path"))?
+                                    .to_string();
+                                Ok((url, directory))
+                            })
+                            .await?
+                        }
+                        .await;
+                        let update = match result {
+                            Ok((url, directory)) => Update::PreviewReady(
+                                request.key,
+                                PreparedPreview { url, directory },
+                            ),
+                            Err(error) => {
+                                Update::ExportFinished(request.key, Err(error.to_string()))
+                            }
+                        };
+                        send_update(&output, update).await;
+                    });
+                    #[cfg(target_family = "wasm")]
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let update = match client
+                            .browser_preview(&request.session, request.generation, &request.export)
+                            .await
+                        {
+                            Ok(url) => Update::PreviewReady(request.key, PreparedPreview { url }),
+                            Err(error) => {
+                                Update::ExportFinished(request.key, Err(error.to_string()))
+                            }
+                        };
+                        send_update(&output, update).await;
+                    });
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
-        let update = match client.snapshot(selected.as_deref(), before).await {
-            Ok(snapshot) => Update::Snapshot(selected.clone(), snapshot),
+        if let Some(result) = frame_result {
+            let update = match result {
+                Ok(()) => Update::Accepted(None),
+                Err(error) => Update::Error(error),
+            };
+            if !send_update(&output, update).await {
+                return;
+            }
+        }
+        let mut frame_active = false;
+        let update = match client
+            .snapshot_pages(selected.as_deref(), before, aside_before)
+            .await
+        {
+            Ok(snapshot) => {
+                frame_active = snapshot
+                    .telemetry
+                    .values()
+                    .any(|value| value.frame.is_some() || value.buddy.is_some());
+                Update::Snapshot(selected.clone(), before, aside_before, Box::new(snapshot))
+            }
             Err(error) => Update::Error(format!("Daemon disconnected: {error}")),
         };
         if !send_update(&output, update).await {
             return;
         }
-        bridge_sleep(300).await;
+        // Animate only while a frame is open; ordinary sessions keep the lower polling rate.
+        bridge_sleep(if frame_active { 50 } else { 300 }).await;
     }
 }
 
@@ -5398,5 +8720,225 @@ fn ui_font() -> &'static str {
         "Segoe UI"
     } else {
         "DejaVu Sans"
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod preference_persistence_tests {
+    #[test]
+    fn original_document_loads_preserve_recovered_drafts_and_ignore_stale_results()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&directory.path().join("state.sqlite"))?;
+        let workspace = store.create_workspace("Editors", directory.path().to_str().unwrap())?;
+        let session = store.create_session(&workspace, "Editor", crate::model::Backend::Demo)?;
+        store.approval(&session, 0, crate::model::PendingApproval {
+            id:"editor-1".into(), tool:"File".into(), arguments:"original".into(), document:None, choices:Vec::new(),
+            requirement:serde_json::json!({"kind":"plank_editor","revision":"revision-1","generation":0}),
+        })?;
+        let mut snapshot = store.snapshot(Some(&session), 0)?;
+        let editor = snapshot.sessions[0].approvals[0].clone();
+        let mut request = super::DocumentLoad {
+            attempt: uuid::Uuid::new_v4(),
+            key: super::document_key(&session, &editor),
+            session,
+            editor,
+        };
+        let next_attempt = uuid::Uuid::new_v4();
+        let (abort, _registration) = futures_util::future::AbortHandle::new_pair();
+        let mut jobs = std::collections::HashMap::from([(
+            request.key.clone(),
+            super::DocumentJob {
+                attempt: next_attempt,
+                abort,
+            },
+        )]);
+        assert!(
+            !request.finish_job(&mut jobs),
+            "A late response must not retire a newer retry"
+        );
+        assert_eq!(jobs.len(), 1);
+        request.attempt = next_attempt;
+        assert!(request.finish_job(&mut jobs));
+        assert!(jobs.is_empty());
+        let mut documents = std::collections::HashMap::new();
+        documents.insert(
+            request.key.clone(),
+            crate::document::Document::new("unsaved recovery"),
+        );
+        assert!(!request.install(
+            &snapshot,
+            &mut documents,
+            crate::document::Document::new("original")
+        ));
+        assert_eq!(documents[&request.key].text(), "unsaved recovery");
+        documents.clear();
+        snapshot.sessions[0].approvals[0].requirement["revision"] = "replaced".into();
+        assert!(!request.install(
+            &snapshot,
+            &mut documents,
+            crate::document::Document::new("late")
+        ));
+        snapshot.sessions[0].approvals[0] = request.editor.clone();
+        assert!(request.install(
+            &snapshot,
+            &mut documents,
+            crate::document::Document::new("original")
+        ));
+        documents.clear();
+        snapshot.sessions[0].approvals.clear();
+        assert!(!request.install(
+            &snapshot,
+            &mut documents,
+            crate::document::Document::new("closed")
+        ));
+        Ok(())
+    }
+
+    use super::{Preferences, load_preferences, persist_preferences, persist_preferences_based};
+
+    #[test]
+    fn appearance_windows_preserve_the_latest_drafts_and_reject_corrupt_existing_state()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut current = Preferences::default();
+        current.documents.insert(
+            "editor".into(),
+            crate::document::Document::new("latest unsaved 🦀"),
+        );
+        current
+            .drafts
+            .insert("session".into(), "latest prompt".into());
+        current.pending_prompts.insert(
+            "session".into(),
+            ("request".into(), "uncertain prompt".into()),
+        );
+        persist_preferences(directory.path(), &current, false)?;
+        let appearance = Preferences {
+            theme: 3,
+            design: 2,
+            ..Default::default()
+        };
+        persist_preferences(directory.path(), &appearance, true)?;
+        let recovered = load_preferences(directory.path());
+        assert_eq!(recovered.documents["editor"].text(), "latest unsaved 🦀");
+        assert_eq!(recovered.drafts["session"], "latest prompt");
+        assert_eq!(recovered.pending_prompts["session"].0, "request");
+        assert_eq!((recovered.theme, recovered.design), (3, 2));
+        let path = directory.path().join("preferences.json");
+        std::fs::write(&path, "corrupt preferences")?;
+        assert!(persist_preferences(directory.path(), &appearance, true).is_err());
+        assert_eq!(std::fs::read_to_string(path)?, "corrupt preferences");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_windows_merge_distinct_drafts_and_preserve_deletions() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut shared = Preferences::default();
+        shared.drafts.insert("stale".into(), "to be deleted".into());
+        shared.collapsed.insert("old".into());
+        persist_preferences(directory.path(), &shared, false)?;
+        let base = load_preferences(directory.path());
+
+        // Window A edits its own draft and deletes the stale one.
+        let mut window_a = base.clone();
+        window_a.drafts.insert("a".into(), "draft-a".into());
+        window_a.drafts.remove("stale");
+        window_a.collapsed.insert("a-ws".into());
+        window_a.theme = 2;
+        // Window B, still on the same baseline, edits a different draft.
+        let mut window_b = base.clone();
+        window_b.drafts.insert("b".into(), "draft-b".into());
+        window_b
+            .documents
+            .insert("doc-b".into(), crate::document::Document::new("doc b"));
+        window_b.design = 1;
+
+        persist_preferences_based(directory.path(), &window_a, false, Some(&base))?;
+        // B's baseline predates A's save; its save must not lose A's work.
+        persist_preferences_based(directory.path(), &window_b, false, Some(&base))?;
+        let merged = load_preferences(directory.path());
+        assert_eq!(merged.drafts["a"], "draft-a");
+        assert_eq!(merged.drafts["b"], "draft-b");
+        assert!(
+            !merged.drafts.contains_key("stale"),
+            "A's deletion must survive B's save"
+        );
+        assert_eq!(merged.documents["doc-b"].text(), "doc b");
+        assert!(merged.collapsed.contains("a-ws"));
+        assert!(merged.collapsed.contains("old"));
+        assert_eq!(merged.theme, 2, "A's theme change is kept");
+        assert_eq!(merged.design, 1, "B's design change is kept");
+
+        // Same-key conflict: the later saver wins, other keys are untouched.
+        let mut window_a2 = merged.clone();
+        window_a2.drafts.insert("a".into(), "draft-a2".into());
+        persist_preferences_based(directory.path(), &window_a2, false, Some(&window_a))?;
+        let after = load_preferences(directory.path());
+        assert_eq!(after.drafts["a"], "draft-a2");
+        assert_eq!(after.drafts["b"], "draft-b");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod task_form_tests {
+    use super::TaskForm;
+
+    fn task() -> crate::model::EngineTask {
+        crate::model::EngineTask {
+            id: 7,
+            subject: "Review changes".into(),
+            status: "pending".into(),
+            active_form: Some("Reviewing".into()),
+        }
+    }
+
+    #[test]
+    fn task_forms_refuse_reused_or_changed_rows_but_allow_status_updates() {
+        let original = task();
+        let form = TaskForm::Rename(original.clone());
+        let mut rows = vec![original];
+        assert!(form.is_current(Some(&rows)));
+        rows[0].status = "completed".into();
+        assert!(form.is_current(Some(&rows)));
+        rows[0].subject = "Another conversation reused this ID".into();
+        assert!(!form.is_current(Some(&rows)));
+        rows[0] = task();
+        rows[0].active_form = Some("Changed by the engine".into());
+        assert!(!form.is_current(Some(&rows)));
+        assert!(!form.is_current(None));
+        assert!(!form.is_current(Some(&[])));
+    }
+
+    #[test]
+    fn task_forms_skip_unchanged_bounded_labels_and_prepare_explicit_changes() {
+        assert!(
+            TaskForm::Rename(task())
+                .command("Review changes", "20")
+                .is_none()
+        );
+        assert!(
+            TaskForm::Active(task())
+                .command("Reviewing", "20")
+                .is_none()
+        );
+        assert_eq!(
+            TaskForm::Rename(task()).command("New label", "20"),
+            Some("/tasks rename 7 New label".into())
+        );
+        assert_eq!(
+            TaskForm::Active(task()).command("", "20"),
+            Some("/tasks active 7 -".into())
+        );
+        assert_eq!(
+            TaskForm::Add.command("New task", "20"),
+            Some("/tasks add New task".into())
+        );
+        assert_eq!(
+            TaskForm::Goal.command("clear", "5"),
+            Some("/goal --max 5 clear".into())
+        );
     }
 }

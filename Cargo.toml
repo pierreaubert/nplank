@@ -12,13 +12,16 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["gui"]
 test-engine = []
-gui = ["dep:sysinfo", "dep:gpui", "dep:gpui-miniapp", "dep:gpui-ui-kit", "dep:gpui-ui-kit-macros", "dep:gpui-design"]
+gui = ["dep:sysinfo", "dep:gpui", "dep:gpui-miniapp", "dep:gpui-ui-kit", "dep:gpui-ui-kit-macros", "dep:gpui-design", "dep:image", "dep:notify-rust", "dep:unicode-segmentation"]
 
 [dependencies]
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 futures-util = "0.3"
+unicode-segmentation = { version = "1.13", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "v7"] }
 gpui = { package = "sotf-gpui-toolkit-gpui", git = "https://github.com/pierreaubert/sotf-3rdparties", branch = "foreign-parent-win-linux", version = "0.2.3", default-features = false, optional = true }
 gpui-miniapp = { path = "../gpui-toolkit/crates/gpui-miniapp", default-features = false, optional = true }
@@ -33,13 +36,15 @@ fs2 = "0.4"
 mimalloc = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal", "fs"] }
 tokio-tungstenite = "0.29"
 tempfile = "3"
-sha2 = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sysinfo = { version = "0.36", default-features = false, features = ["system"], optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+notify-rust = { version = "4.18.0", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
@@ -48,7 +53,7 @@ wasm-bindgen = "=0.2.127"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 parking_lot = { version = "0.12", features = ["nightly"] }
-web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "Document", "HtmlElement", "HtmlAnchorElement", "Request", "Response", "Headers", "Blob", "Url", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "Document", "HtmlElement", "HtmlAnchorElement", "Request", "Response", "Headers", "Blob", "BlobPropertyBag", "Url", "console", "Notification", "NotificationOptions", "NotificationPermission", "Event", "DomException", "DomStringList", "IdbFactory", "IdbDatabase", "IdbRequest", "IdbOpenDbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -75,6 +80,11 @@ required-features = ["test-engine"]
 name = "nplank-test-agent"
 path = "tests/fixtures/agent.rs"
 required-features = ["test-engine"]
+
+[[bin]]
+name = "nplank-ui-qa"
+path = "src/bin/nplank-ui-qa.rs"
+required-features = ["gui", "test-engine"]
 
 [profile.dev]
 debug = 0

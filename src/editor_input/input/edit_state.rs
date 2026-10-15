@@ -9,6 +9,8 @@ struct EditSnapshot {
 /// Internal editing state for input.
 #[derive(Clone, Default)]
 pub struct EditState {
+    /// Transient IME preedit range in Unicode scalar columns.
+    pub(super) marked_range: Option<std::ops::Range<usize>>,
     pub(super) navigation_token: Option<u128>,
     /// Whether currently editing
     pub(super) editing: bool,
@@ -43,11 +45,40 @@ impl std::fmt::Debug for EditState {
 }
 
 impl EditState {
+    // Retain a bounded amount of text across undo and redo. A single oversized
+    // snapshot is kept so the latest large edit can still be reversed.
+    const HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
+    fn trim_history(&mut self, favor_undo: bool) {
+        let bytes = |snapshot: &EditSnapshot| {
+            snapshot.text.capacity() + std::mem::size_of::<EditSnapshot>()
+        };
+        let mut retained = self
+            .undo_stack
+            .iter()
+            .chain(&self.redo_stack)
+            .map(bytes)
+            .sum::<usize>();
+        while self.undo_stack.len() + self.redo_stack.len() > 1
+            && (retained > Self::HISTORY_BYTES
+                || self.undo_stack.len() + self.redo_stack.len() > Self::MAX_UNDO_HISTORY)
+        {
+            let stack =
+                if (!favor_undo && !self.undo_stack.is_empty()) || self.redo_stack.is_empty() {
+                    &mut self.undo_stack
+                } else {
+                    &mut self.redo_stack
+                };
+            retained = retained.saturating_sub(bytes(&stack.remove(0)));
+        }
+    }
+
     pub(super) fn navigate(&mut self, token: u128, range: std::ops::Range<usize>) {
         if self.navigation_token == Some(token) {
             return;
         }
         let length = self.text.chars().count();
+        self.marked_range = None;
         let start = range.start.min(length);
         let end = range.end.min(length).max(start);
         self.selection_anchor = (start != end).then_some(start);
@@ -62,6 +93,7 @@ impl EditState {
         // Preserve uncommitted edits when the parent value did not change.
         // A changed parent value can come from external undo, import, or reset.
         if previous != current && self.editing && self.text != current {
+            self.marked_range = None;
             current.clone_into(&mut self.text);
             self.cursor = self.cursor.min(self.text.chars().count());
             self.clear_selection();
@@ -77,6 +109,7 @@ impl EditState {
     }
 
     fn restore_snapshot(&mut self, snapshot: EditSnapshot) {
+        self.marked_range = None;
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
         self.selection_anchor = snapshot.selection_anchor;
@@ -87,6 +120,7 @@ impl EditState {
     /// call this, so undo returns to the previous text edit rather than a
     /// navigation position.
     pub(super) fn begin_text_edit(&mut self) {
+        self.marked_range = None;
         if self.undo_stack.len() == Self::MAX_UNDO_HISTORY {
             // Recycle the evicted snapshot's text allocation. Once the
             // bounded history is warm, routine edits must not allocate just
@@ -101,6 +135,7 @@ impl EditState {
             self.undo_stack.push(self.snapshot());
         }
         self.redo_stack.clear();
+        self.trim_history(true);
     }
 
     pub fn undo(&mut self) -> bool {
@@ -109,6 +144,7 @@ impl EditState {
         };
         self.redo_stack.push(self.snapshot());
         self.restore_snapshot(previous);
+        self.trim_history(false);
         true
     }
 
@@ -118,6 +154,7 @@ impl EditState {
         };
         self.undo_stack.push(self.snapshot());
         self.restore_snapshot(next);
+        self.trim_history(true);
         true
     }
 
@@ -125,6 +162,7 @@ impl EditState {
     /// history are cleared immediately so a password is not retained in the
     /// thread-local widget state after focus leaves the field.
     pub(super) fn finish_edit(&mut self) -> String {
+        self.marked_range = None;
         self.editing = false;
         self.clear_selection();
         self.is_dragging = false;
@@ -136,6 +174,7 @@ impl EditState {
 
     /// Discard an uncommitted edit without retaining its raw text or history.
     pub(super) fn abandon_edit(&mut self) {
+        self.marked_range = None;
         self.editing = false;
         self.clear_selection();
         self.is_dragging = false;
@@ -148,6 +187,7 @@ impl EditState {
         let len = value.chars().count();
         Self {
             editing: true,
+            marked_range: None,
             navigation_token: None,
             text: value.to_string(),
             cursor: len,
@@ -507,6 +547,7 @@ impl EditState {
 
     /// Start a selection at the given position
     pub fn start_selection(&mut self, pos: usize) {
+        self.marked_range = None;
         self.cursor = pos;
         self.selection_anchor = Some(pos);
         self.is_dragging = true;
@@ -598,6 +639,33 @@ impl EditState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_native_edits_bound_combined_history_and_keep_the_latest_inverse() {
+        let original = "x".repeat(EditState::HISTORY_BYTES + 1);
+        let mut state = EditState::new(&original);
+        state.clear_selection();
+        state.cursor = state.text.chars().count();
+        for _ in 0..12 {
+            state.insert_text("🦀");
+        }
+        assert_eq!(state.undo_stack.len() + state.redo_stack.len(), 1);
+        assert!(state.undo());
+        assert!(state.text.ends_with(&"🦀".repeat(11)));
+        assert_eq!(state.undo_stack.len() + state.redo_stack.len(), 1);
+        assert!(state.redo());
+        assert!(state.text.ends_with(&"🦀".repeat(12)));
+        assert!(state.undo());
+        assert!(state.redo());
+        let viewport = super::super::viewport::Viewport::new(&state.text, state.cursor);
+        assert!(state.text[viewport.bytes].len() <= super::super::viewport::MAX_COLUMNS * 4);
+        state.select_all();
+        assert!(
+            state.get_selected_text().as_deref() == Some(state.text.as_str()),
+            "Viewport clipping must not truncate clipboard text"
+        );
+        assert!(state.text.len() > EditState::HISTORY_BYTES);
+    }
 
     #[test]
     fn unicode_insert_delete_backspace() {

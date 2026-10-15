@@ -98,12 +98,16 @@ thread_local! {
 }
 
 mod cleanup;
+mod document_pointer;
 mod edit_state;
 mod input_size;
 mod misc;
+mod text_layout;
 mod types;
+mod viewport;
 
 pub use cleanup::cleanup_stale_input_states;
+pub(crate) use document_pointer::DocumentPointer;
 use edit_state::EditState;
 pub use input_size::InputSize;
 use misc::keystroke_to_char;
@@ -115,9 +119,11 @@ pub use types::{InputTheme, InputVariant};
 /// callback safe to use with password inputs and protocol traces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputSelection {
+    pub composing: bool,
     pub start: usize,
     pub end: usize,
     pub reversed: bool,
+    pub extend_document: bool,
 }
 
 /// Schema-style validator for [`Input`]: maps a value to an error message.
@@ -129,6 +135,13 @@ type TextHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 type EditStartHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 type EditEndHandler = Rc<dyn Fn(Option<String>, &mut Window, &mut App)>;
 type SelectionHandler = Rc<dyn Fn(InputSelection, &mut Window, &mut App)>;
+type NativeEditHandler = Rc<
+    dyn for<'a> Fn(
+        crate::document::NativeEdit<'a>,
+        &mut Window,
+        &mut App,
+    ) -> Option<crate::document::NativeState>,
+>;
 
 /// A text input component with full keyboard editing support
 ///
@@ -166,9 +179,13 @@ pub struct Input {
     /// Called when the cursor or selected range changes. The callback exposes
     /// positions only, never the selected value.
     on_selection_change: Option<SelectionHandler>,
+    on_native_edit: Option<NativeEditHandler>,
     /// Focus handle for this input
     focus_handle: Option<FocusHandle>,
     navigation: Option<(u128, Range<usize>)>,
+    navigation_marked: Option<Range<usize>>,
+    document_selection: Option<Range<usize>>,
+    document_pointer: Option<(SharedString, Rc<RefCell<DocumentPointer>>)>,
     aria_label: Option<SharedString>,
     aria_role: Option<AriaRole>,
 }
@@ -224,8 +241,12 @@ impl Input {
             on_edit_end: None,
             on_text_change: None,
             on_selection_change: None,
+            on_native_edit: None,
             focus_handle: None,
             navigation: None,
+            navigation_marked: None,
+            document_selection: None,
+            document_pointer: None,
             aria_label: None,
             aria_role: None,
         }
@@ -443,6 +464,68 @@ impl Input {
         self.navigation = Some((token, range));
         self
     }
+
+    pub(crate) fn navigate_native(
+        mut self,
+        token: u128,
+        range: Range<usize>,
+        marked: Option<Range<usize>>,
+    ) -> Self {
+        self.navigation = Some((token, range));
+        self.navigation_marked = marked;
+        self
+    }
+
+    pub(crate) fn on_native_edit(
+        mut self,
+        handler: impl for<'a> Fn(
+            crate::document::NativeEdit<'a>,
+            &mut Window,
+            &mut App,
+        ) -> Option<crate::document::NativeState>
+        + 'static,
+    ) -> Self {
+        self.on_native_edit = Some(Rc::new(handler));
+        self
+    }
+
+    /// Highlights a document-wide selection without changing this input's focus.
+    pub(crate) fn document_selection(mut self, range: Option<Range<usize>>) -> Self {
+        self.document_selection = range;
+        self
+    }
+
+    /// Shares pointer ownership with the other rows of this editor.
+    pub(crate) fn document_pointer(
+        mut self,
+        scope: SharedString,
+        pointer: Rc<RefCell<DocumentPointer>>,
+    ) -> Self {
+        self.document_pointer = Some((scope, pointer));
+        self
+    }
+
+    pub(crate) fn focused_selection(
+        id: impl Into<ElementId>,
+        window: &Window,
+    ) -> Option<InputSelection> {
+        let id = id.into();
+        let focused = FOCUS_HANDLES.with(|handles| {
+            handles
+                .borrow()
+                .get(&id)
+                .is_some_and(|handle| handle.is_focused(window))
+        });
+        if !focused {
+            return None;
+        }
+        EDIT_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map(|state| InputEntity::selection_from_state(&state.borrow()))
+        })
+    }
 }
 
 impl InputEntity {
@@ -498,7 +581,6 @@ impl InputEntity {
     }
 
     fn replace_char_range(state: &mut EditState, range: Range<usize>, text: &str) {
-        state.begin_text_edit();
         let char_len = state.text.chars().count();
         let start = range.start.min(char_len);
         let end = range.end.min(char_len).max(start);
@@ -516,6 +598,72 @@ impl InputEntity {
         state.text.replace_range(start_byte..end_byte, text);
         state.cursor = start + text.chars().count();
         state.clear_selection();
+    }
+
+    /// Applies one native update; repeated preedit changes share one undo entry.
+    fn replace_native_text(
+        state: &mut EditState,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        composing: bool,
+        selected_utf16: Option<Range<usize>>,
+    ) {
+        let range = range_utf16
+            .map(|range| {
+                Self::utf16_to_char(&state.text, range.start)
+                    ..Self::utf16_to_char(&state.text, range.end)
+            })
+            .or_else(|| state.marked_range.clone())
+            .unwrap_or_else(|| Self::current_selected_char_range(state));
+        let start = range.start.min(state.text.chars().count());
+        if state.marked_range.is_none() {
+            state.begin_text_edit();
+        }
+        Self::replace_char_range(state, range, text);
+        state.marked_range =
+            (composing && !text.is_empty()).then(|| start..start + text.chars().count());
+        if composing && let Some(selected) = selected_utf16 {
+            let from = start + Self::utf16_to_char(text, selected.start);
+            let to = (start + Self::utf16_to_char(text, selected.end)).max(from);
+            state.selection_anchor = (from != to).then_some(from);
+            state.cursor = to;
+        }
+    }
+
+    fn native_range(state: &EditState, range: Option<Range<usize>>) -> Range<usize> {
+        range
+            .map(|range| {
+                Self::utf16_to_char(&state.text, range.start)
+                    ..Self::utf16_to_char(&state.text, range.end)
+            })
+            .or_else(|| state.marked_range.clone())
+            .unwrap_or_else(|| Self::current_selected_char_range(state))
+    }
+
+    fn publish_native_edit(
+        &self,
+        state: &mut EditState,
+        edit: crate::document::NativeEdit<'_>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(handler) = &self.props.on_native_edit else {
+            return false;
+        };
+        let Some(result) = handler(edit, window, cx) else {
+            return false;
+        };
+        Self::apply_native_state(state, result);
+        true
+    }
+
+    fn apply_native_state(state: &mut EditState, result: crate::document::NativeState) {
+        state.text = result.text;
+        state.cursor = result.selected.end;
+        state.selection_anchor =
+            (result.selected.start != result.selected.end).then_some(result.selected.start);
+        state.marked_range = result.marked;
+        state.navigation_token = Some(result.token);
     }
 
     fn current_selected_char_range(state: &EditState) -> Range<usize> {
@@ -543,11 +691,13 @@ impl InputEntity {
     fn selection_from_state(state: &EditState) -> InputSelection {
         let range = Self::current_selected_char_range(state);
         InputSelection {
+            composing: state.marked_range.is_some(),
             start: range.start,
             end: range.end,
             reversed: state
                 .selection_anchor
                 .is_some_and(|anchor| state.cursor < anchor),
+            extend_document: false,
         }
     }
 
@@ -601,29 +751,23 @@ impl InputEntity {
             return;
         }
 
-        // Calculate cursor position from click.
-        let edit_text = state.text.clone();
-        let text_len = edit_text.chars().count();
-        let char_width = 8.0_f32;
-        let click_x: f32 = event.position.x.into();
-        let id = self.props.id.clone();
+        if let Some((scope, pointer)) = &self.props.document_pointer {
+            pointer.borrow_mut().begin(scope.clone());
+        }
 
-        let stored_origin = TEXT_ORIGINS.with(|o| o.borrow().get(&id).copied());
-        let char_pos_f = click_x / char_width;
-        let origin = stored_origin.unwrap_or_else(|| {
-            let cp = char_pos_f.round().min(text_len as f32);
-            (click_x - cp * char_width).max(0.0)
-        });
-        TEXT_ORIGINS.with(|o| {
-            o.borrow_mut().insert(id, origin);
-        });
-
-        let char_pos = (((click_x - origin) / char_width).round() as usize).min(text_len);
+        let char_pos = self
+            .text_layout
+            .borrow()
+            .as_ref()
+            .map_or(0, |layout| layout.column(event.position.x))
+            .min(state.text.chars().count());
 
         let was_editing = state.editing;
         state.editing = true;
         state.start_selection(char_pos);
-        let selection = Self::selection_from_state(&state);
+        self.document_pointer_extension = event.modifiers.shift;
+        let mut selection = Self::selection_from_state(&state);
+        selection.extend_document = event.modifiers.shift;
         drop(state);
 
         if !was_editing && let Some(ref handler) = self.props.on_edit_start {
@@ -639,21 +783,58 @@ impl InputEntity {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((scope, pointer)) = &self.props.document_pointer {
+            if pointer
+                .borrow_mut()
+                .extends(scope, event.pressed_button == Some(MouseButton::Left))
+            {
+                self.extend_document_pointer(event, window, cx);
+            }
+            return;
+        }
         let mut state = self.edit_state.borrow_mut();
         if state.is_dragging && state.editing {
-            let edit_text = state.text.clone();
-            let text_len = edit_text.chars().count();
-            let char_width = 8.0_f32;
-            let move_x: f32 = event.position.x.into();
-            let id = self.props.id.clone();
-            let origin = TEXT_ORIGINS.with(|o| o.borrow().get(&id).copied().unwrap_or(0.0));
-            let char_pos = (((move_x - origin) / char_width).round() as usize).min(text_len);
+            let char_pos = self
+                .text_layout
+                .borrow()
+                .as_ref()
+                .map_or(0, |layout| layout.column(event.position.x))
+                .min(state.text.chars().count());
             state.update_selection(char_pos);
-            let selection = Self::selection_from_state(&state);
+            let mut selection = Self::selection_from_state(&state);
+            selection.extend_document = self.document_pointer_extension;
             drop(state);
             self.emit_selection_change(selection, window, cx);
             window.refresh();
         }
+    }
+
+    fn extend_document_pointer(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let mut state = self.edit_state.borrow_mut();
+        if !state.editing {
+            *state = EditState::new(self.props.value.as_ref());
+        }
+        let layout = self.text_layout.borrow();
+        let Some(layout) = layout.as_ref() else {
+            return;
+        };
+        let column = layout
+            .column(event.position.x)
+            .min(state.text.chars().count());
+        state.editing = true;
+        state.start_selection(column);
+        self.document_pointer_extension = true;
+        let mut selection = Self::selection_from_state(&state);
+        selection.extend_document = true;
+        drop(state);
+        self.emit_selection_change(selection, window, cx);
+        window.refresh();
     }
 
     fn handle_mouse_up(
@@ -665,7 +846,9 @@ impl InputEntity {
         let mut state = self.edit_state.borrow_mut();
         if state.is_dragging {
             state.end_selection();
-            let selection = Self::selection_from_state(&state);
+            let mut selection = Self::selection_from_state(&state);
+            selection.extend_document = self.document_pointer_extension;
+            self.document_pointer_extension = false;
             drop(state);
             self.emit_selection_change(selection, window, cx);
             window.refresh();
@@ -711,7 +894,9 @@ impl InputEntity {
                         if let Some(ref handler) = self.props.on_text_change {
                             handler(&state.text, window, cx);
                         }
+                        let selection = Self::selection_from_state(&state);
                         drop(state);
+                        self.emit_selection_change(selection, window, cx);
                         window.refresh();
                     }
                     return true;
@@ -724,7 +909,9 @@ impl InputEntity {
                         if let Some(ref handler) = self.props.on_text_change {
                             handler(&state.text, window, cx);
                         }
+                        let selection = Self::selection_from_state(&state);
                         drop(state);
+                        self.emit_selection_change(selection, window, cx);
                         window.refresh();
                     }
                     return true;
@@ -853,7 +1040,9 @@ impl InputEntity {
                     if let Some(ref handler) = self.props.on_text_change {
                         handler(&state.text, window, cx);
                     }
+                    let selection = Self::selection_from_state(&state);
                     drop(state);
+                    self.emit_selection_change(selection, window, cx);
                     window.refresh();
                     return true;
                 }
@@ -862,7 +1051,9 @@ impl InputEntity {
                     if let Some(ref handler) = self.props.on_text_change {
                         handler(&state.text, window, cx);
                     }
+                    let selection = Self::selection_from_state(&state);
                     drop(state);
+                    self.emit_selection_change(selection, window, cx);
                     window.refresh();
                     return true;
                 }
@@ -927,7 +1118,9 @@ impl InputEntity {
             if let Some(ref handler) = self.props.on_text_change {
                 handler(&state.text, window, cx);
             }
+            let selection = Self::selection_from_state(&state);
             drop(state);
+            self.emit_selection_change(selection, window, cx);
             window.refresh();
             return true;
         }
@@ -986,7 +1179,9 @@ impl InputEntity {
                 if let Some(ref handler) = self.props.on_text_change {
                     handler(&state.text, window, cx);
                 }
+                let selection = Self::selection_from_state(&state);
                 drop(state);
+                self.emit_selection_change(selection, window, cx);
                 window.refresh();
             }
             "delete" => {
@@ -994,7 +1189,9 @@ impl InputEntity {
                 if let Some(ref handler) = self.props.on_text_change {
                     handler(&state.text, window, cx);
                 }
+                let selection = Self::selection_from_state(&state);
                 drop(state);
+                self.emit_selection_change(selection, window, cx);
                 window.refresh();
             }
             "left" => {
@@ -1047,7 +1244,9 @@ impl InputEntity {
                     if let Some(ref handler) = self.props.on_text_change {
                         handler(&state.text, window, cx);
                     }
+                    let selection = Self::selection_from_state(&state);
                     drop(state);
+                    self.emit_selection_change(selection, window, cx);
                     window.refresh();
                 } else {
                     return false;
@@ -1063,7 +1262,14 @@ impl InputEntity {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((_, pointer)) = &self.props.document_pointer {
+            pointer.borrow_mut().finish();
+        }
         if !self.focus_handle.is_focused(window) && !self.edit_state.borrow().editing {
+            return;
+        }
+        // Native IME callbacks own text and cursor updates until commit/unmark.
+        if self.edit_state.borrow().marked_range.is_some() {
             return;
         }
         if event.keystroke.key.as_str() == "tab" {
@@ -1165,10 +1371,22 @@ impl EntityInputHandler for InputEntity {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        None
+        if self.props.disabled || self.props.readonly {
+            return None;
+        }
+        let state = self.edit_state.borrow();
+        state.marked_range.as_ref().map(|range| {
+            Self::char_to_utf16(&state.text, range.start)
+                ..Self::char_to_utf16(&state.text, range.end)
+        })
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        let mut state = self.edit_state.borrow_mut();
+        state.marked_range = None;
+        self.publish_native_edit(&mut state, crate::document::NativeEdit::Unmark, window, _cx);
+        window.refresh();
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -1183,14 +1401,22 @@ impl EntityInputHandler for InputEntity {
 
         self.ensure_editing_state();
         let mut state = self.edit_state.borrow_mut();
-        let range = range.map_or_else(
-            || Self::current_selected_char_range(&state),
-            |range| {
-                Self::utf16_to_char(&state.text, range.start)
-                    ..Self::utf16_to_char(&state.text, range.end)
+        let native_range = Self::native_range(&state, range.clone());
+        Self::replace_native_text(&mut state, range, text, false, None);
+        if self.publish_native_edit(
+            &mut state,
+            crate::document::NativeEdit::Replace {
+                range: native_range,
+                text,
+                composing: false,
+                selected: None,
             },
-        );
-        Self::replace_char_range(&mut state, range, text);
+            window,
+            cx,
+        ) {
+            window.refresh();
+            return;
+        }
         let selection = Self::selection_from_state(&state);
         self.emit_text_change(&state.text, window, cx);
         drop(state);
@@ -1210,40 +1436,48 @@ impl EntityInputHandler for InputEntity {
             return;
         }
 
-        self.replace_text_in_range(range, new_text, window, cx);
-        if let Some(selected_range) = new_selected_range {
-            let mut state = self.edit_state.borrow_mut();
-            let start = Self::utf16_to_char(&state.text, selected_range.start);
-            let end = Self::utf16_to_char(&state.text, selected_range.end);
-            state.selection_anchor = Some(start);
-            state.cursor = end;
-            let selection = Self::selection_from_state(&state);
-            drop(state);
-            self.emit_selection_change(selection, window, cx);
+        self.ensure_editing_state();
+        let mut state = self.edit_state.borrow_mut();
+        let native_range = Self::native_range(&state, range.clone());
+        let selected = new_selected_range.as_ref().map(|range| {
+            Self::utf16_to_char(new_text, range.start)..Self::utf16_to_char(new_text, range.end)
+        });
+        Self::replace_native_text(&mut state, range, new_text, true, new_selected_range);
+        if self.publish_native_edit(
+            &mut state,
+            crate::document::NativeEdit::Replace {
+                range: native_range,
+                text: new_text,
+                composing: true,
+                selected,
+            },
+            window,
+            cx,
+        ) {
+            window.refresh();
+            return;
         }
+        let selection = Self::selection_from_state(&state);
+        self.emit_text_change(&state.text, window, cx);
+        drop(state);
+        self.emit_selection_change(selection, window, cx);
+        window.refresh();
     }
 
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
+        _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let state = self.edit_state.borrow();
         let start = Self::utf16_to_char(&state.text, range_utf16.start);
         let end = Self::utf16_to_char(&state.text, range_utf16.end).max(start);
-        let char_width = 8.0_f32;
-        Some(Bounds {
-            origin: gpui::point(
-                element_bounds.origin.x + px(start as f32 * char_width),
-                element_bounds.origin.y,
-            ),
-            size: gpui::size(
-                px((end - start).max(1) as f32 * char_width),
-                element_bounds.size.height,
-            ),
-        })
+        self.text_layout
+            .borrow()
+            .as_ref()
+            .map(|layout| layout.range_bounds(start, end))
     }
 
     fn character_index_for_point(
@@ -1253,9 +1487,10 @@ impl EntityInputHandler for InputEntity {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let state = self.edit_state.borrow();
-        let char_width = 8.0_f32;
-        let x: f32 = point.x.into();
-        Some(((x / char_width).round().max(0.0) as usize).min(state.text.chars().count()))
+        self.text_layout
+            .borrow()
+            .as_ref()
+            .map(|layout| Self::char_to_utf16(&state.text, layout.column(point.x)))
     }
 
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
@@ -1316,6 +1551,26 @@ impl Element for InputElement {
     ) {
         let entity = self.entity.clone();
         let focus_handle = self.focus_handle.clone();
+        let pointer = self
+            .entity
+            .read(cx)
+            .props
+            .document_pointer
+            .as_ref()
+            .map(|(_, pointer)| Rc::clone(pointer));
+        if let Some(pointer) = pointer {
+            let down = Rc::clone(&pointer);
+            window.on_mouse_event(move |_event: &MouseDownEvent, phase, _window, _cx| {
+                if phase == DispatchPhase::Capture {
+                    down.borrow_mut().finish();
+                }
+            });
+            window.on_mouse_event(move |_event: &MouseUpEvent, phase, _window, _cx| {
+                if phase == DispatchPhase::Capture {
+                    pointer.borrow_mut().finish();
+                }
+            });
+        }
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Capture
                 && focus_handle.is_focused(window)
@@ -1396,8 +1651,8 @@ impl Render for InputEntity {
             None
         };
         let cursor_pos = state.cursor;
-        let edit_text: Option<SharedString> =
-            (editing && state.editing).then(|| state.text.clone().into());
+        let marked_range = editing.then(|| state.marked_range.clone()).flatten();
+        let editing_text = editing && state.editing;
         drop(state);
 
         let border_color = if has_error {
@@ -1408,7 +1663,7 @@ impl Render for InputEntity {
             props.border_color.unwrap_or(theme.border)
         };
 
-        let mut container = div().flex().flex_col().gap_1();
+        let mut container = div().flex().flex_col().gap_1().min_w_0().w_full();
 
         // Label
         if let Some(label) = &props.label {
@@ -1427,6 +1682,8 @@ impl Render for InputEntity {
 
         // Input wrapper
         let mut input_wrapper = div()
+            .min_w_0()
+            .w_full()
             .id(props.id.clone())
             .debug_selector(move || input_debug_id)
             .font_family(global_theme.font_family.clone())
@@ -1509,25 +1766,58 @@ impl Render for InputEntity {
                 input_wrapper.child(div().text_color(placeholder_color).child(icon.clone()));
         }
 
-        // Determine display text. Keep it as a `SharedString` when it comes from
-        // props so we don't allocate a new `String` on every render.
-        let editing_text = edit_text.is_some();
-        let clear_display_text: SharedString = if let Some(text) = edit_text {
-            text
+        // Shape only a window of a long line. The native editing state remains
+        // complete, so selection, clipboard, replacement and IME keep full offsets.
+        let state = self.edit_state.borrow();
+        let placeholder_text = props.placeholder.clone().unwrap_or_default();
+        let clear_text = if editing_text {
+            state.text.as_str()
         } else if props.value.is_empty() {
-            props.placeholder.clone().unwrap_or_default()
+            placeholder_text.as_ref()
         } else {
-            props.value.clone()
+            props.value.as_ref()
         };
+        let anchor = if editing {
+            cursor_pos
+        } else {
+            props
+                .document_selection
+                .as_ref()
+                .map_or(0, |range| range.end)
+        };
+        let viewport = viewport::Viewport::new(clear_text, anchor);
+        let fragment = &clear_text[viewport.bytes.clone()];
+        let hidden_tail = viewport.bytes.end < clear_text.len();
         let display_text: SharedString =
             if props.password && (editing_text || !props.value.is_empty()) {
-                Self::cached_password_mask(&self.display_password_mask, clear_display_text.as_ref())
+                Self::cached_password_mask(&self.display_password_mask, fragment)
+            } else if !editing_text
+                && viewport.bytes == (0..props.value.len())
+                && !props.value.is_empty()
+            {
+                props.value.clone()
             } else {
-                clear_display_text
+                fragment.to_owned().into()
             };
+        drop(state);
+        let cursor_pos = viewport.local(cursor_pos);
+        let selection_anchor = selection_anchor.map(|column| viewport.local(column));
 
         // Build the text element with partial selection support
-        let mut text_el = div().id(field_id).flex_1().flex().items_center();
+        let origin_id = props.id.clone();
+        let mut segments = text_layout::Segments::Plain;
+        let measured_text = display_text.clone();
+        let placeholder = !editing_text && props.value.is_empty();
+        let layout_cache = Rc::clone(&self.text_layout);
+        let mut text_el = div()
+            .id(field_id)
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .whitespace_nowrap()
+            .items_center();
 
         text_el = match props.size {
             InputSize::Xs => text_el.text_xs(),
@@ -1536,12 +1826,17 @@ impl Render for InputEntity {
             InputSize::Lg => text_el,
         };
 
-        if editing {
+        if editing || props.document_selection.is_some() {
             let len = display_text.chars().count();
             let cursor_pos = cursor_pos.min(len);
             let selection_anchor = selection_anchor.map(|a| a.min(len));
 
-            let (sel_start, sel_end) = if let Some(anchor) = selection_anchor {
+            let (sel_start, sel_end) = if let Some(range) = &props.document_selection {
+                (
+                    viewport.local(range.start).min(len),
+                    viewport.local(range.end).min(len),
+                )
+            } else if let Some(anchor) = selection_anchor {
                 (cursor_pos.min(anchor), cursor_pos.max(anchor))
             } else {
                 (cursor_pos, cursor_pos)
@@ -1551,7 +1846,20 @@ impl Render for InputEntity {
 
             if sel_start == sel_end {
                 let text = display_text.as_ref();
-                let (cursor_byte, _) = Self::char_range_byte_offsets(text, cursor_pos, len);
+                let newline_selected = props
+                    .document_selection
+                    .as_ref()
+                    .is_some_and(|range| range.is_empty());
+                let column = if newline_selected {
+                    sel_start
+                } else {
+                    cursor_pos
+                };
+                let (cursor_byte, _) = Self::char_range_byte_offsets(text, column, len);
+                segments = text_layout::Segments::Caret {
+                    column,
+                    width: if newline_selected { 8.0 } else { 1.5 },
+                };
                 let before: SharedString = text[..cursor_byte].into();
                 let after: SharedString = text[cursor_byte..].into();
                 let cursor_debug_id = format!("{}-cursor", props.id);
@@ -1569,9 +1877,14 @@ impl Render for InputEntity {
                     div()
                         .debug_selector(move || cursor_debug_id)
                         .flex_none()
-                        .w(px(1.5))
+                        // Reserve a visible marker for a selected line break.
+                        .w(px(if newline_selected { 8.0 } else { 1.5 }))
                         .h(cursor_height)
-                        .bg(cursor_color),
+                        .bg(if newline_selected {
+                            selection_bg
+                        } else {
+                            cursor_color
+                        }),
                 );
                 if !after.is_empty() {
                     text_el = text_el.child(after);
@@ -1580,6 +1893,10 @@ impl Render for InputEntity {
                 let text = display_text.as_ref();
                 let (sel_start_byte, sel_end_byte) =
                     Self::char_range_byte_offsets(text, sel_start, sel_end);
+                segments = text_layout::Segments::Selection {
+                    start: sel_start,
+                    end: sel_end,
+                };
                 let before: SharedString = text[..sel_start_byte].into();
                 let selected: SharedString = text[sel_start_byte..sel_end_byte].into();
                 let after: SharedString = text[sel_end_byte..].into();
@@ -1598,7 +1915,48 @@ impl Render for InputEntity {
             text_el = text_el.text_color(text_color).child(display_text);
         }
 
+        let paint_layout = Rc::clone(&self.text_layout);
+        let first_column = viewport.first_column;
+        if first_column != 0 {
+            input_wrapper =
+                input_wrapper.child(div().text_color(placeholder_color).text_xs().child("…"));
+        }
+        text_el = text_el.child(
+            gpui::canvas(
+                move |bounds, window, _| {
+                    TEXT_ORIGINS.with(|origins| {
+                        origins
+                            .borrow_mut()
+                            .insert(origin_id.clone(), bounds.origin.x.into());
+                    });
+                    *layout_cache.borrow_mut() = Some(text_layout::TextLayout::measure(
+                        &measured_text,
+                        segments,
+                        placeholder,
+                        first_column,
+                        bounds,
+                        window,
+                    ));
+                },
+                move |_, (), window, _| {
+                    if let Some(range) = &marked_range
+                        && let Some(layout) = paint_layout.borrow().as_ref()
+                    {
+                        let mut bounds = layout.range_bounds(range.start, range.end);
+                        bounds.origin.y += bounds.size.height - px(1.0);
+                        bounds.size.height = px(1.0);
+                        window.paint_quad(gpui::fill(bounds, cursor_color));
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
         input_wrapper = input_wrapper.child(text_el);
+        if hidden_tail {
+            input_wrapper =
+                input_wrapper.child(div().text_color(placeholder_color).text_xs().child("…"));
+        }
 
         // Right icon
         if let Some(icon) = &props.icon_right {
@@ -1623,6 +1981,8 @@ impl Render for InputEntity {
 
 /// Internal entity that renders an [`Input`] with stable identity across frames.
 struct InputEntity {
+    text_layout: Rc<RefCell<Option<text_layout::TextLayout>>>,
+    document_pointer_extension: bool,
     props: Input,
     focus_handle: FocusHandle,
     edit_state: Rc<RefCell<EditState>>,
@@ -1659,6 +2019,8 @@ impl RenderOnce for Input {
                 return entity;
             }
             let entity = cx.new(|_cx| InputEntity {
+                text_layout: Default::default(),
+                document_pointer_extension: false,
                 props: Input::new(id.clone()),
                 focus_handle: focus_handle.clone(),
                 edit_state: edit_state.clone(),
@@ -1701,6 +2063,7 @@ impl RenderOnce for Input {
                         *state = EditState::new(model.props.value.as_ref());
                     }
                     state.navigate(*token, range.clone());
+                    state.marked_range = model.props.navigation_marked.clone();
                     model.focus_handle.focus(window, cx);
                 }
             }

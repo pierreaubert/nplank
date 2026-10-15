@@ -59,12 +59,28 @@ impl Client {
     /// # Errors
     /// Returns connection, authentication, or response errors.
     pub async fn snapshot(&self, session: Option<&str>, before: i64) -> Result<Snapshot> {
+        self.snapshot_pages(session, before, 0).await
+    }
+
+    /// Fetches independently paged main and side-answer histories.
+    ///
+    /// # Errors
+    /// Returns connection, authentication, or response errors.
+    pub async fn snapshot_pages(
+        &self,
+        session: Option<&str>,
+        before: i64,
+        aside_before: i64,
+    ) -> Result<Snapshot> {
         let mut request = self
             .http
             .get(format!("{}/v1/snapshot", self.url))
             .timeout(Duration::from_secs(5))
             .bearer_auth(&self.token)
-            .query(&[("before", before.to_string())]);
+            .query(&[
+                ("before", before.to_string()),
+                ("aside_before", aside_before.to_string()),
+            ]);
         if let Some(id) = session {
             request = request.query(&[("session", id)]);
         }
@@ -81,19 +97,101 @@ impl Client {
     /// # Errors
     /// Returns network errors or the daemon's validation message.
     pub async fn execute(&self, command: &Command) -> Result<Receipt> {
-        let response = self
-            .http
-            .post(format!("{}/v1/command", self.url))
-            .timeout(Duration::from_secs(5))
-            .bearer_auth(&self.token)
-            .json(command)
-            .send()
-            .await?;
+        let response = self.command_request(command)?.send().await?;
         if !response.status().is_success() {
             let body: serde_json::Value = response.json().await?;
             anyhow::bail!("{}", body["error"].as_str().unwrap_or("Command failed"));
         }
         Ok(response.json().await?)
+    }
+
+    /// Fetches bounded chunks and validates an original document before publishing it.
+    ///
+    /// # Errors
+    /// Returns authentication, stale revision, transfer, checksum, or UTF-8 errors.
+    pub async fn load_document(
+        &self,
+        session: &str,
+        editor: &crate::model::PendingApproval,
+    ) -> Result<String> {
+        let document = editor
+            .document
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Document metadata is unavailable"))?;
+        ensure!(
+            document.bytes <= crate::documenttransfer::DOCUMENT_BYTES
+                && document.sha256.len() == 64,
+            "Invalid document metadata"
+        );
+        let requirement = serde_json::to_string(&editor.requirement)?;
+        ensure!(
+            session.len() <= 256 && editor.id.len() <= 256 && requirement.len() <= 8192,
+            "Invalid editor metadata"
+        );
+        collect_document(document, |offset| {
+            let request = self
+                .http
+                .get(format!("{}/v1/editor", self.url))
+                .timeout(Duration::from_secs(60))
+                .bearer_auth(&self.token)
+                .query(&[
+                    ("session", session),
+                    ("document", editor.id.as_str()),
+                    ("requirement", requirement.as_str()),
+                    ("offset", &offset.to_string()),
+                ]);
+            let expected = (document.bytes - offset).min(crate::model::EDITOR_FETCH_BYTES);
+            async move {
+                let response = request.send().await?.error_for_status()?;
+                ensure!(
+                    response.content_length() == Some(expected as u64),
+                    "Invalid document chunk length"
+                );
+                let bytes = response.bytes().await?;
+                ensure!(bytes.len() == expected, "Document chunk was truncated");
+                Ok(bytes.to_vec())
+            }
+        })
+        .await
+    }
+
+    fn command_request(&self, command: &Command) -> Result<reqwest::RequestBuilder> {
+        if let Command::EditDocument {
+            session_id,
+            approval_id,
+            requirement,
+            text: Some(text),
+        } = command
+        {
+            ensure!(
+                text.len() <= crate::documenttransfer::DOCUMENT_BYTES,
+                "Document exceeds the editing limit"
+            );
+            let requirement = serde_json::to_string(requirement)?;
+            let bytes = text.len().to_string();
+            let sha256 = crate::documenttransfer::digest(text.as_bytes());
+            return Ok(self
+                .http
+                .post(format!("{}/v1/editor", self.url))
+                // Bulk uploads can cross slower remote links independently of polling.
+                .timeout(Duration::from_secs(60))
+                .bearer_auth(&self.token)
+                .query(&[
+                    ("session", session_id.as_str()),
+                    ("document", approval_id.as_str()),
+                    ("requirement", requirement.as_str()),
+                    ("bytes", bytes.as_str()),
+                    ("sha256", sha256.as_str()),
+                ])
+                .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(text.clone()));
+        }
+        Ok(self
+            .http
+            .post(format!("{}/v1/command", self.url))
+            .timeout(Duration::from_secs(5))
+            .bearer_auth(&self.token)
+            .json(command))
     }
 
     /// Saves a complete export atomically, checking length and checksum first.
@@ -128,13 +226,62 @@ impl Client {
     ///
     /// # Errors
     /// Returns metadata, network, HTTP or browser file preparation errors.
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(target_family = "wasm", feature = "gui"))]
     pub(crate) async fn browser_export(
         &self,
         session: &str,
         generation: u64,
         export: &crate::model::EngineExport,
     ) -> Result<String> {
+        let blob = self
+            .browser_export_blob(session, generation, export)
+            .await?;
+        web_sys::Url::create_object_url_with_blob(&blob)
+            .map_err(|_| anyhow::anyhow!("Cannot prepare browser file"))
+    }
+
+    /// Prepares a bounded sandboxed preview after explicit user selection.
+    ///
+    /// # Errors
+    /// Returns metadata, network, integrity, or browser preparation errors.
+    #[cfg(all(target_family = "wasm", feature = "gui"))]
+    pub(crate) async fn browser_preview(
+        &self,
+        session: &str,
+        generation: u64,
+        export: &crate::model::EngineExport,
+    ) -> Result<String> {
+        use wasm_bindgen_futures::JsFuture;
+        ensure!(
+            export.format == "html" && export.bytes <= crate::preview::MAX_BYTES,
+            "Preview requires HTML of at most 32 MiB; download the file instead"
+        );
+        let blob = self
+            .browser_export_blob(session, generation, export)
+            .await?;
+        let html = JsFuture::from(blob.text())
+            .await
+            .map_err(|_| anyhow::anyhow!("Cannot read preview"))?
+            .as_string()
+            .ok_or_else(|| anyhow::anyhow!("Invalid preview text"))?;
+        let page = crate::preview::document(export, &html)?;
+        let parts = js_sys::Array::new();
+        parts.push(&wasm_bindgen::JsValue::from_str(&page));
+        let options = web_sys::BlobPropertyBag::new();
+        options.set_type("text/html;charset=utf-8");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+            .map_err(|_| anyhow::anyhow!("Cannot prepare HTML preview"))?;
+        web_sys::Url::create_object_url_with_blob(&blob)
+            .map_err(|_| anyhow::anyhow!("Cannot prepare preview URL"))
+    }
+
+    #[cfg(all(target_family = "wasm", feature = "gui"))]
+    async fn browser_export_blob(
+        &self,
+        session: &str,
+        generation: u64,
+        export: &crate::model::EngineExport,
+    ) -> Result<web_sys::Blob> {
         use wasm_bindgen::JsCast;
         use wasm_bindgen_futures::JsFuture;
         ensure!(export.is_valid(), "Invalid export metadata");
@@ -176,9 +323,7 @@ impl Client {
         .dyn_into()
         .map_err(|_| anyhow::anyhow!("Invalid export file"))?;
         ensure!(blob.size() == export.bytes as f64, "Export length changed");
-        // A browser Blob avoids a complete-file copy into WASM linear memory.
-        web_sys::Url::create_object_url_with_blob(&blob)
-            .map_err(|_| anyhow::anyhow!("Cannot prepare browser file"))
+        Ok(blob)
     }
 }
 
@@ -230,9 +375,164 @@ async fn save_download(
     Ok(())
 }
 
+async fn collect_document<F, Fut>(
+    document: &crate::model::EditorDocument,
+    mut fetch: F,
+) -> Result<String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    ensure!(
+        document.bytes <= crate::documenttransfer::DOCUMENT_BYTES && document.sha256.len() == 64,
+        "Invalid document metadata"
+    );
+    let mut text = Vec::with_capacity(document.bytes.min(crate::model::EDITOR_FETCH_BYTES));
+    for offset in (0..document.bytes.max(1)).step_by(crate::model::EDITOR_FETCH_BYTES) {
+        let bytes = fetch(offset).await?;
+        ensure!(
+            bytes.len() == (document.bytes - offset).min(crate::model::EDITOR_FETCH_BYTES),
+            "Invalid document chunk length"
+        );
+        text.extend_from_slice(&bytes);
+    }
+    ensure!(
+        crate::documenttransfer::digest(&text) == document.sha256,
+        "Original document checksum mismatch"
+    );
+    Ok(String::from_utf8(text)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Client;
+
+    #[tokio::test]
+    async fn original_document_collection_validates_chunks_before_publishing_utf8()
+    -> anyhow::Result<()> {
+        let text = format!(
+            "{}🦀 café",
+            "x".repeat(crate::model::EDITOR_FETCH_BYTES - 1)
+        );
+        let document = crate::model::EditorDocument {
+            bytes: text.len(),
+            sha256: crate::documenttransfer::digest(text.as_bytes()),
+        };
+        for mode in 0..5 {
+            let result = super::collect_document(&document, |offset| {
+                let mut bytes = text.as_bytes()
+                    [offset..text.len().min(offset + crate::model::EDITOR_FETCH_BYTES)]
+                    .to_vec();
+                if mode == 1 {
+                    bytes[0] ^= 1;
+                }
+                if mode == 2 {
+                    bytes.pop();
+                }
+                if mode == 3 {
+                    bytes.push(b'x');
+                }
+                async move {
+                    anyhow::ensure!(mode != 4 || offset == 0, "Editor closed during transfer");
+                    Ok(bytes)
+                }
+            })
+            .await;
+            if mode == 0 {
+                assert!(
+                    result? == text,
+                    "UTF-8 split across byte chunks must reassemble exactly"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let empty = crate::model::EditorDocument {
+            bytes: 0,
+            sha256: crate::documenttransfer::digest(b""),
+        };
+        assert_eq!(
+            super::collect_document(&empty, |_| async { Ok(Vec::new()) }).await?,
+            ""
+        );
+        let invalid_utf8 = crate::model::EditorDocument {
+            bytes: 1,
+            sha256: crate::documenttransfer::digest(&[0xff]),
+        };
+        assert!(
+            super::collect_document(&invalid_utf8, |_| async { Ok(vec![0xff]) })
+                .await
+                .is_err()
+        );
+        let oversized = crate::model::EditorDocument {
+            bytes: crate::documenttransfer::DOCUMENT_BYTES + 1,
+            sha256: "0".repeat(64),
+        };
+        assert!(
+            super::collect_document(&oversized, |_| async {
+                panic!("Invalid metadata must not initiate a fetch")
+            })
+            .await
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn editor_requests_keep_document_text_out_of_json_and_preserve_exact_requirements()
+    -> anyhow::Result<()> {
+        let client = Client::new("http://127.0.0.1:47831", "fixture-token".into())?;
+        let text = "\u{0}".repeat(1024 * 1024);
+        let requirement =
+            serde_json::json!({"kind":"plank_editor","generation":4,"revision":"rev-1"});
+        let command = crate::model::Command::EditDocument {
+            session_id: "session-1".into(),
+            approval_id: "editor-1".into(),
+            requirement: requirement.clone(),
+            text: Some(text.clone()),
+        };
+        let request = client.command_request(&command)?.build()?;
+        assert_eq!(request.url().path(), "/v1/editor");
+        assert_eq!(
+            request.headers()["content-type"],
+            "text/plain; charset=utf-8"
+        );
+        assert!(
+            request
+                .body()
+                .and_then(|body| body.as_bytes())
+                .is_some_and(|body| body == text.as_bytes())
+        );
+        let encoded = request
+            .url()
+            .query_pairs()
+            .find(|(key, _)| key == "requirement")
+            .unwrap()
+            .1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded)?,
+            requirement
+        );
+        let query: std::collections::HashMap<_, _> = request.url().query_pairs().collect();
+        assert_eq!(query["session"], "session-1");
+        assert_eq!(query["document"], "editor-1");
+        assert_eq!(query["bytes"], text.len().to_string());
+        assert_eq!(
+            query["sha256"],
+            crate::documenttransfer::digest(text.as_bytes())
+        );
+        let cancel = crate::model::Command::EditDocument {
+            session_id: "session-1".into(),
+            approval_id: "editor-1".into(),
+            requirement,
+            text: None,
+        };
+        assert_eq!(
+            client.command_request(&cancel)?.build()?.url().path(),
+            "/v1/command"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn export_download_replaces_only_complete_verified_files_and_removes_partials()
@@ -293,11 +593,13 @@ mod tests {
         export.purpose = crate::model::ExportPurpose::Insights;
         let current = crate::model::EngineMetrics::Insights {
             markdown: "report".into(),
+            charts: Vec::new(),
             html_sha256: Some(export.sha256.clone()),
         };
         assert!(export.matches_insights(&current));
         let different = crate::model::EngineMetrics::Insights {
             markdown: "new report".into(),
+            charts: Vec::new(),
             html_sha256: Some("1".repeat(64)),
         };
         assert!(!export.matches_insights(&different));

@@ -1,0 +1,4 @@
+[submodule "plank"]
+	path = plank
+	url = git@github.com:pierreaubert/plank.git
+	branch = main

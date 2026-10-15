@@ -1,13 +1,13 @@
 //! Stages complete engine exports in anonymous files and verifies their integrity.
 //!
-//! File content stays out of snapshots and SQLite. One pending and one completed
-//! file per category are retained per session generation. Anonymous temporary files close on
+//! File content stays out of snapshots and SQLite. One pending transfer and a
+//! bounded verified history are retained per session generation. Anonymous files close on
 //! failure, reset, daemon exit or process death. Concurrent readers use independent
 //! byte offsets under the file lock rather than sharing a cloned descriptor cursor.
 
 // Rust guideline compliant 2026-02-21
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -22,6 +22,9 @@ use crate::model::EngineExport;
 
 /// Matches the engine's chunk ceiling; total exports are not frame-size limited.
 const CHUNK_BYTES: usize = 32 * 1024;
+// Bound descriptor count and disk retention while keeping the newest complete file.
+pub(crate) const HISTORY_FILES: usize = 128;
+const HISTORY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -106,7 +109,27 @@ struct Completed {
 struct SessionArtifacts {
     generation: u64,
     pending: Option<Pending>,
-    completed: HashMap<crate::model::ExportPurpose, Completed>,
+    completed: VecDeque<Completed>,
+    retired: u64,
+}
+
+impl SessionArtifacts {
+    fn trim(&mut self, files: usize, bytes: u64) {
+        let mut retained_bytes: u128 = self
+            .completed
+            .iter()
+            .map(|file| u128::from(file.metadata.bytes))
+            .sum();
+        while self.completed.len() > files
+            || (self.completed.len() > 1 && retained_bytes > u128::from(bytes))
+        {
+            let Some(oldest) = self.completed.pop_front() else {
+                break;
+            };
+            retained_bytes -= u128::from(oldest.metadata.bytes);
+            self.retired = self.retired.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -161,14 +184,16 @@ impl Artifacts {
             .or_insert_with(|| SessionArtifacts {
                 generation,
                 pending: None,
-                completed: HashMap::new(),
+                completed: VecDeque::new(),
+                retired: 0,
             });
         ensure!(generation >= state.generation, "Stale export generation");
         if generation > state.generation {
             *state = SessionArtifacts {
                 generation,
                 pending: None,
-                completed: HashMap::new(),
+                completed: VecDeque::new(),
+                retired: 0,
             };
         }
         if let ArtifactEvent::Abort { id, reason } = event {
@@ -212,8 +237,8 @@ impl Artifacts {
                 "Invalid export format"
             );
             ensure!(
-                purpose != crate::model::ExportPurpose::Insights || format == "html",
-                "Insights artifact must be HTML"
+                purpose == crate::model::ExportPurpose::Conversation || format == "html",
+                "Report and preview artifacts must be HTML"
             );
             ensure!(
                 sha256.len() == 64
@@ -278,13 +303,11 @@ impl Artifacts {
                 );
                 pending.file.flush()?;
                 let metadata = pending.metadata;
-                state.completed.insert(
-                    metadata.purpose,
-                    Completed {
-                        metadata: metadata.clone(),
-                        file: Arc::new(Mutex::new(pending.file)),
-                    },
-                );
+                state.completed.push_back(Completed {
+                    metadata: metadata.clone(),
+                    file: Arc::new(Mutex::new(pending.file)),
+                });
+                state.trim(HISTORY_FILES, HISTORY_BYTES);
                 Ok(Some(metadata))
             }
             ArtifactEvent::Begin { .. } => {
@@ -346,10 +369,7 @@ impl Artifacts {
             .sessions
             .get(session)
             .filter(|state| state.generation == generation)?;
-        let completed = state
-            .completed
-            .values()
-            .find(|file| file.metadata.id == id)?;
+        let completed = state.completed.iter().find(|file| file.metadata.id == id)?;
         Some((completed.metadata.clone(), Arc::clone(&completed.file)))
     }
 
@@ -361,11 +381,19 @@ impl Artifacts {
             .map(|state| {
                 state
                     .completed
-                    .values()
+                    .iter()
+                    .rev()
                     .map(|file| file.metadata.clone())
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn retired(&self, session: &str, generation: u64) -> u64 {
+        self.sessions
+            .get(session)
+            .filter(|state| state.generation == generation)
+            .map_or(0, |state| state.retired)
     }
 }
 
@@ -602,14 +630,80 @@ mod tests {
         assert_eq!(report.purpose, crate::model::ExportPurpose::Insights);
         let (_, file) = artifacts.file("session", 1, &report.id).unwrap();
         assert_eq!(read(&file, 0).unwrap(), b"report");
+        let mut preview = begin("preview");
+        if let ArtifactEvent::Begin { purpose, .. } = &mut preview {
+            *purpose = crate::model::ExportPurpose::Preview;
+        }
+        artifacts.ingest("session", 1, preview).unwrap();
+        artifacts
+            .ingest(
+                "session",
+                1,
+                ArtifactEvent::Chunk {
+                    id: "export-1".into(),
+                    offset: 0,
+                    text: "preview".into(),
+                },
+            )
+            .unwrap();
+        let preview = artifacts
+            .ingest(
+                "session",
+                1,
+                ArtifactEvent::End {
+                    id: "export-1".into(),
+                    bytes: 7,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let (_, file) = artifacts.file("session", 1, &preview.id).unwrap();
+        assert_eq!(read(&file, 0).unwrap(), b"preview");
         let newer = complete(&mut artifacts, 1, "new conversation");
-        assert!(artifacts.file("session", 1, &conversation.id).is_none());
+        let (_, original) = artifacts.file("session", 1, &conversation.id).unwrap();
+        assert_eq!(read(&original, 0).unwrap(), b"conversation");
         assert!(artifacts.file("session", 1, &newer.id).is_some());
         assert!(artifacts.file("session", 1, &report.id).is_some());
-        assert_eq!(artifacts.sessions["session"].completed.len(), 2);
-        assert_eq!(artifacts.metadata("session", 1).len(), 2);
+        assert!(artifacts.file("session", 1, &preview.id).is_some());
+        assert_eq!(artifacts.sessions["session"].completed.len(), 4);
+        assert_eq!(artifacts.metadata("session", 1).len(), 4);
+        assert_eq!(artifacts.metadata("session", 1)[0], newer);
         assert!(artifacts.metadata("session", 2).is_empty());
         artifacts.clear("session", 1);
         assert!(artifacts.metadata("session", 1).is_empty());
+    }
+
+    #[test]
+    fn export_inventory_retires_oldest_files_and_preserves_existing_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut artifacts = Artifacts::new(dir.path()).unwrap();
+        let first = complete(&mut artifacts, 1, "first");
+        let (_, reader) = artifacts.file("session", 1, &first.id).unwrap();
+        let mut latest = first.clone();
+        for _ in 0..HISTORY_FILES {
+            latest = complete(&mut artifacts, 1, "new");
+        }
+        assert_eq!(artifacts.metadata("session", 1).len(), HISTORY_FILES);
+        assert!(artifacts.file("session", 1, &first.id).is_none());
+        assert_eq!(artifacts.retired("session", 1), 1);
+        assert_eq!(read(&reader, 0).unwrap(), b"first");
+        assert_eq!(artifacts.metadata("session", 1)[0], latest);
+        // Exercise the byte policy with real, small files rather than allocating 512 MiB.
+        artifacts
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .trim(HISTORY_FILES, 5);
+        assert_eq!(artifacts.metadata("session", 1), vec![latest.clone()]);
+        assert_eq!(artifacts.retired("session", 1), HISTORY_FILES as u64);
+        artifacts
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .trim(HISTORY_FILES, 1);
+        assert_eq!(artifacts.metadata("session", 1), vec![latest]);
+        artifacts.clear("session", 1);
+        assert!(artifacts.metadata("session", 1).is_empty());
+        assert_eq!(artifacts.retired("session", 1), 0);
     }
 }
