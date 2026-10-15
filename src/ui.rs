@@ -9,7 +9,7 @@ use gpui::{App, Context, SharedString, Window, div, prelude::*, px};
 use gpui_design::{DesignExt, DesignSystem, DesignSystemState};
 use gpui_ui_kit::theme::{ThemeState, ThemeVariant};
 use gpui_ui_kit::{
-    Button, ButtonSize, ButtonVariant, Input, Markdown, Progress, ProgressSize, ThemeExt,
+    Button, ButtonSize, ButtonVariant, Input, Markdown, Progress, ProgressSize, QrCode, ThemeExt,
 };
 use gpui_ui_kit_macros::{ComponentTheme, layout};
 use serde::{Deserialize, Serialize};
@@ -321,6 +321,8 @@ pub struct WorkspaceView {
     #[cfg(target_family = "wasm")]
     browser_exports: HashMap<String, (String, String)>,
     show_new: bool,
+    show_pair: bool,
+    pairing_payload: String,
     appearance: bool,
     appearance_only: bool,
     agent_choice: usize,
@@ -523,6 +525,7 @@ impl WorkspaceView {
     ) -> Self {
         #[cfg(target_family = "wasm")]
         let _ = &directory;
+        let pairing_payload = client.pairing_payload();
         let focus_pending = Arc::new(Mutex::new(None));
         let (tx, rx) = if appearance {
             let (tx, _) = mpsc::channel();
@@ -626,6 +629,8 @@ impl WorkspaceView {
             #[cfg(target_family = "wasm")]
             browser_exports: HashMap::new(),
             show_new: false,
+            show_pair: false,
+            pairing_payload,
             appearance,
             appearance_only: appearance,
             agent_choice: 1,
@@ -1358,6 +1363,13 @@ impl WorkspaceView {
             return;
         };
         let text = self.drafts.get(&id).cloned().unwrap_or_default();
+        if text.split_whitespace().next() == Some("/pair") {
+            // Local-only dialog: never send the pairing request to the engine.
+            // Callers notify after submit returns.
+            self.show_pair = true;
+            self.show_new = false;
+            return;
+        }
         if crate::commands::is_picker_command(&text)
             && let Some(session) = self.snapshot.sessions.iter().find(|session| {
                 session.id == id
@@ -1924,6 +1936,21 @@ impl WorkspaceView {
         })))
         .child(layout! { V[g4] { Hd "Session preview" [level="3"], Tx "Research · Local Plank", Tx.sm "Running · 32 tokens/s" [muted] }})
         .child(Markdown::new("appearance-preview", "### An answer from Plank\n\nTheme changes apply to session views and controls.\n\n```rust\nfn main() { println!(\"Hello, Plank\"); }\n```"))
+        .into_any_element()
+    }
+
+    fn pair_panel(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+        layout! { V[g4] {
+            Hd "Pair a mobile app" [level="2"],
+            Tx "Scan this code with the iOS app to fill its daemon address and token." [muted]
+        }}
+        .child(
+            div()
+                .flex()
+                .justify_center()
+                .py_3()
+                .child(QrCode::new(self.pairing_payload.clone()).size(px(240.0))),
+        )
         .into_any_element()
     }
 
@@ -8154,6 +8181,42 @@ impl Render for WorkspaceView {
                                 ),
                             )
                             .child(self.new_panel(cx)),
+                    ),
+            );
+        }
+        if self.show_pair {
+            root = root.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                    .p_4()
+                    .child(
+                        div()
+                            .id("pair-popup")
+                            .w(px(520.0))
+                            .max_w_full()
+                            .max_h_full()
+                            .overflow_y_scroll()
+                            .bg(colors.background)
+                            .border_1()
+                            .border_color(colors.muted)
+                            .rounded(px(10.0))
+                            .p_4()
+                            .child(
+                                div().flex().justify_end().child(
+                                    Button::new("close-pair", "Close")
+                                        .variant(ButtonVariant::Ghost)
+                                        .on_click(click(cx, |view, _, cx| {
+                                            view.show_pair = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .child(self.pair_panel(cx)),
                     ),
             );
         }

@@ -54,6 +54,39 @@ impl Client {
         })
     }
 
+    /// Builds the pairing payload scanned by the iOS app.
+    ///
+    /// The JSON shape `{"v":1,"url","token"}` is the shared desktop/iOS
+    /// contract; the iOS scanner fills its connect fields from it.
+    #[must_use]
+    pub fn pairing_payload(&self) -> String {
+        serde_json::json!({"v": 1, "url": self.url, "token": self.token}).to_string()
+    }
+
+    /// Parses a scanned pairing payload back into URL and token.
+    ///
+    /// Returns `None` for anything else so stray QR codes never fill
+    /// credentials.
+    #[must_use]
+    pub fn parse_pair_payload(text: &str) -> Option<(String, String)> {
+        let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
+        if parsed.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        let url = parsed
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let token = parsed
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if url.trim().is_empty() || token.trim().is_empty() {
+            return None;
+        }
+        Some((url.to_string(), token.to_string()))
+    }
+
     /// Fetches metadata and the selected transcript page.
     ///
     /// # Errors
@@ -406,6 +439,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::Client;
+
+    #[test]
+    fn pairing_payload_round_trips_and_rejects_stray_codes() {
+        let client = Client::new("http://127.0.0.1:47831", "secret".into())
+            .expect("loopback client must build");
+        let payload = client.pairing_payload();
+        assert_eq!(
+            Client::parse_pair_payload(&payload),
+            Some(("http://127.0.0.1:47831".into(), "secret".into()))
+        );
+        assert_eq!(Client::parse_pair_payload("hello"), None);
+        assert_eq!(
+            Client::parse_pair_payload(r#"{"v":2,"url":"u","token":"t"}"#),
+            None
+        );
+        assert_eq!(
+            Client::parse_pair_payload(r#"{"v":1,"url":"","token":"t"}"#),
+            None
+        );
+        assert_eq!(
+            Client::parse_pair_payload(r#"{"v":1,"url":"u","token":""}"#),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn original_document_collection_validates_chunks_before_publishing_utf8()

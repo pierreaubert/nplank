@@ -68,6 +68,9 @@ pub mod native;
 #[cfg(all(feature = "gui", target_family = "wasm"))]
 mod web;
 
+#[cfg(all(feature = "gui", target_os = "ios"))]
+pub mod ios;
+
 // ComponentTheme currently expands through the host crate's theme namespace.
 #[cfg(feature = "gui")]
 use gpui_ui_kit::theme;

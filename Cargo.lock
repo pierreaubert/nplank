@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "nplank"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3431,6 +3431,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "gpui-design",
+ "gpui-ios",
  "gpui-miniapp",
  "gpui-ui-kit",
  "gpui-ui-kit-macros",

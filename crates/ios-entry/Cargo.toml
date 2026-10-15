@@ -1,0 +1,16 @@
+[package]
+name = "nplank-ios-entry"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "nplank_ios_entry"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+nplank = { path = "../.." }
+
+# The main crate forbids unsafe code workspace-wide; this single-symbol shim
+# is the only place that may export a C symbol to Swift.
+[lints.rust]
+unsafe_code = "allow"

@@ -3,24 +3,32 @@ wasm_toolchain := env_var_or_default("NPLANK_WASM_TOOLCHAIN", "nightly")
 linux_target := env_var_or_default("NPLANK_LINUX_TARGET", "x86_64-unknown-linux-gnu")
 windows_target := env_var_or_default("NPLANK_WINDOWS_TARGET", "x86_64-pc-windows-msvc")
 
+_default:
+	just --list
+
+[group('build')]
 build:
     cargo build
 
 # Build the bundled engine with console slash-command dispatch.
+[group('build')]
 build-plank:
     cd plank && cargo build
 
 # Graphical engine with WASM frames, built-in editing and Rust Gemma inference.
+[group('build')]
 build-plank-gui:
     cd plank && cargo build --no-default-features --features builtin_editor,plugins,gemma
 
 # Real native UI and daemon with disposable state and a model-free Plank engine.
+[group('qa')]
 qa-ui:
     cd plank && PLANK_NO_DS4=1 cargo build --no-default-features --features builtin_editor,plugins,gemma --bin plank
     cargo build --features test-engine --bin nplank --bin nplankd --bin nplank-ui-qa
     cargo run --features test-engine --bin nplank-ui-qa
 
 # Model-free regression for the actual engine's console control path.
+[group('check')]
 check-plank-controls:
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_controls_never_become_model_prompts
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib gui_
@@ -132,89 +140,129 @@ check-plank-controls:
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib console_dialog_pipe
     cd plank && PLANK_NO_DS4=1 cargo test --no-default-features --lib readonly_slash_commands_do_not_dirty_or_log
 
+[group('run')]
 run: build
     cargo run --bin nplank
 
+[group('run')]
 appearance: build
     cargo run --bin nplank -- --appearance
 
+[group('run')]
 daemon:
     cargo run --no-default-features --bin nplankd
 
+[group('run')]
 demo:
     cargo run --bin nplankctl -- demo --directory .
 
+[group('check')]
 check:
     cargo fmt --check
     cargo clippy --all-targets --features test-engine -- -D warnings
     cargo test --features test-engine
 
 # Uses an installed Muse CLI with its model-free, memory-only echo provider.
+[group('test')]
 smoke-muse:
     cargo test --features test-engine --test agents installed_muse_echo_protocol -- --ignored
 
+[group('test')]
 components:
     {{toolkit}} component Input Button Sidebar Markdown
 
+[group('test')]
 themes:
     {{toolkit}} theme list
 
+[group('test')]
 toolkit-check:
     {{toolkit}} doctor --dir .
     {{toolkit}} layout check 'V[g6] > (Hd"Appearance"[level=2] + Tx.sm"Colors and design rules are independently selectable."[muted])'
     {{toolkit}} layout check 'V[g4] > (Hd"Session preview"[level=3] + Tx"Research · Local Plank" + Tx.sm"Running · 32 tokens/s"[muted])'
     {{toolkit}} layout check 'H[g2] > (B.primary"Send"#send + B.destructive"Stop"#stop + B.ghost"Fresh context"#reset)'
 
+[group('build')]
 bundle-macos: build
     cargo run --bin nplank-package
 
+[group('build')]
 bundle-appearance-macos: build
     cargo run --bin nplank-package -- --appearance
 
+# macOS DMG via scripts/build-macos.sh (unsigned unless DEVELOPER_ID is set).
+[group('build')]
+dmg:
+    ./scripts/build-macos.sh
+
+# iOS static libraries via scripts/build-ios.sh (packaging/signing happens in Xcode).
+[group('build')]
+ios:
+    ./scripts/build-ios.sh
+
+# Sign dist/ DMGs (and optionally notarize) via scripts/sign-macos.sh.
+[group('release')]
+sign:
+    ./scripts/sign-macos.sh
+
 # WASM uses nightly only; native recipes retain the default toolchain.
+[group('wasm')]
 wasm-setup:
     rustup toolchain install {{wasm_toolchain}} --component rust-src --target wasm32-unknown-unknown
     cargo install wasm-bindgen-cli --version 0.2.127 --locked
 
+[group('wasm')]
 wasm-check:
     RUSTUP_TOOLCHAIN={{wasm_toolchain}} CARGO_UNSTABLE_BUILD_STD=std,panic_abort cargo check --target wasm32-unknown-unknown --lib
 
+[group('wasm')]
 wasm-build:
     RUSTUP_TOOLCHAIN={{wasm_toolchain}} CARGO_UNSTABLE_BUILD_STD=std,panic_abort cargo build --release --target wasm32-unknown-unknown --lib
     cargo run --no-default-features --bin nplank-web-package
 
 # Opens at http://127.0.0.1:47831; stop an existing daemon before starting this one.
+[group('wasm')]
 wasm-serve: wasm-build
     cargo run --no-default-features --bin nplankd -- --web-dir target/web
 
+[group('check')]
 check-macos:
     cargo check --all-targets --target aarch64-apple-darwin
 
+[group('build')]
 build-macos:
     cargo build --release --target aarch64-apple-darwin
 
 # Run on the matching host, or configure its cross-compiler and native SDKs.
+[group('check')]
 check-linux:
     cargo check --all-targets --target {{linux_target}}
 
+[group('build')]
 build-linux:
     cargo build --release --target {{linux_target}}
 
+[group('check')]
 check-windows:
     cargo check --all-targets --target {{windows_target}}
 
+[group('build')]
 build-windows:
     cargo build --release --target {{windows_target}}
 
 # Shared library checks/builds; mobile launch hosts and app packaging are pending.
+[group('check')]
 check-ios:
     cargo check --target aarch64-apple-ios-sim --lib
 
+[group('build')]
 build-ios:
     cargo build --release --target aarch64-apple-ios --lib
 
+[group('check')]
 check-android:
     cargo ndk -t arm64-v8a check --lib
 
+[group('build')]
 build-android:
     cargo ndk -t arm64-v8a build --release --lib

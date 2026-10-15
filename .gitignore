@@ -1,5 +1,7 @@
-/target/
+target/
 /.nplank/
+builds/
+dist/
 *.log
 *~
 
