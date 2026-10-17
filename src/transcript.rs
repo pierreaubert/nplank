@@ -10,6 +10,7 @@ pub(crate) struct Message<'a> {
     pub role: &'a str,
     pub text: Cow<'a, str>,
     pub boundary: bool,
+    pub kind: Option<crate::model::EntryKind>,
 }
 
 impl std::fmt::Debug for Message<'_> {
@@ -36,10 +37,9 @@ pub(crate) fn messages(entries: &[Entry]) -> Vec<Message<'_>> {
         .filter(|entry| !entry.role.starts_with("aside"))
     {
         let boundary = entry.is_context_boundary();
-        if let Some(last) = messages
-            .last_mut()
-            .filter(|last| !last.boundary && !boundary && last.role == entry.role)
-        {
+        if let Some(last) = messages.last_mut().filter(|last| {
+            !last.boundary && !boundary && last.role == entry.role && last.kind == entry.kind
+        }) {
             last.text.to_mut().push_str(&entry.text);
         } else {
             messages.push(Message {
@@ -47,6 +47,7 @@ pub(crate) fn messages(entries: &[Entry]) -> Vec<Message<'_>> {
                 role: &entry.role,
                 text: Cow::Borrowed(&entry.text),
                 boundary,
+                kind: entry.kind.clone(),
             });
         }
     }
@@ -60,6 +61,7 @@ mod tests {
 
     fn entry(sequence: i64, role: &str, text: &str) -> Entry {
         Entry {
+            kind: None,
             sequence,
             session_id: "session".into(),
             role: role.into(),
@@ -94,6 +96,26 @@ mod tests {
         assert_eq!(all.iter().filter(|message| message.boundary).count(), 2);
         assert!(all.iter().any(|message| message.text == "old"));
         assert!(!format!("{:?}", current[2]).contains("Hello"));
+    }
+
+    #[test]
+    fn kinds_group_separately_and_carry_through() {
+        use crate::model::EntryKind;
+        let kind = EntryKind::ToolCall {
+            name: "read".into(),
+            target: "src/main.rs".into(),
+        };
+        let mut first = entry(1, "tool", "chunk ");
+        first.kind = Some(kind.clone());
+        let mut second = entry(2, "tool", "two");
+        second.kind = Some(kind);
+        let plain = entry(3, "tool", "plain");
+        let entries = [first, second, plain];
+        let grouped = messages(&entries);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].text, "chunk two");
+        assert!(matches!(grouped[0].kind, Some(EntryKind::ToolCall { .. })));
+        assert_eq!(grouped[1].kind, None);
     }
 
     #[test]
@@ -159,6 +181,27 @@ mod tests {
         drop(store);
         let store = crate::store::Store::open(&path)?;
         assert_eq!(store.snapshot(Some(&id), 0)?.entries, saved);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn entry_kinds_round_trip_and_plain_entries_stay_kindless() -> anyhow::Result<()> {
+        use crate::model::EntryKind;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.sqlite");
+        let store = crate::store::Store::open(&path)?;
+        let workspace = store.create_workspace("Local", directory.path().to_str().unwrap())?;
+        let id = store.create_session(&workspace, "Agent", crate::model::Backend::Demo)?;
+        let kind = EntryKind::ToolCall {
+            name: "read".into(),
+            target: "src/main.rs".into(),
+        };
+        store.append_with_kind(&id, "tool", "reading", Some(&kind))?;
+        store.append(&id, "assistant", "done")?;
+        let entries = store.snapshot(Some(&id), 0)?.entries;
+        assert_eq!(entries[0].kind, Some(kind));
+        assert_eq!(entries[1].kind, None);
         Ok(())
     }
 }

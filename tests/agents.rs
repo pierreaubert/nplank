@@ -47,6 +47,7 @@ fn prompt(daemon: &Arc<Daemon>, id: &str, text: &str) -> Result<()> {
         session_id: id.into(),
         request_id: uuid::Uuid::new_v4().to_string(),
         text: text.into(),
+        images: Vec::new(),
     })?;
     Ok(())
 }

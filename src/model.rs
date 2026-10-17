@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Client/daemon protocol version, including bounded UTF-8 document uploads.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Bounds each original-document HTTP response, including browser fetches.
 pub const EDITOR_FETCH_BYTES: usize = crate::documenttransfer::CHUNK_BYTES * 8;
@@ -15,6 +15,31 @@ pub struct Workspace {
     pub id: String,
     pub name: String,
     pub directory: String,
+}
+
+/// A checkout belonging to a Git project within one workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Worktree {
+    pub id: String,
+    pub workspace_id: String,
+    /// Canonical Git common directory, scoped to this daemon host.
+    pub project_id: String,
+    pub project_name: String,
+    pub directory: String,
+    pub branch: Option<String>,
+    pub main: bool,
+    pub locked: bool,
+    /// Retained for archived transcripts after physical checkout removal.
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// A read-only checkout inspection captured on the daemon host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeChanges {
+    pub status: String,
+    pub staged: String,
+    pub unstaged: String,
 }
 
 /// Supported third-party coding-agent protocols.
@@ -137,6 +162,9 @@ impl RunState {
 /// A durable session associated with one workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Absent in legacy sessions, which keep using the workspace directory.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
     #[serde(default)]
     pub progress: Option<EngineProgress>,
     #[serde(default)]
@@ -221,6 +249,37 @@ impl Session {
     }
 }
 
+/// Structural classification of a transcript entry, when the engine
+/// reported more than plain text. Absent means plain text (old daemons,
+/// old databases) and renders exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryKind {
+    /// A tool invocation: display name and its primary target.
+    ToolCall {
+        /// Tool display name (may be empty when unknown).
+        name: String,
+        /// File path, command, or URL the tool acts on.
+        target: String,
+    },
+    /// A tool result; `ok` distinguishes failures.
+    ToolResult {
+        /// Whether the tool reported success.
+        ok: bool,
+    },
+    /// A unified diff for one file.
+    Diff {
+        /// Path the diff applies to.
+        path: String,
+    },
+    /// A produced file the client can offer for download or preview.
+    Artifact {
+        /// Display name of the artifact.
+        name: String,
+        /// Media type, when known.
+        media_type: String,
+    },
+}
+
 /// One ordered transcript entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -228,6 +287,9 @@ pub struct Entry {
     pub session_id: String,
     pub role: String,
     pub text: String,
+    /// Structural kind, when known. Defaulted for wire/database compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EntryKind>,
 }
 
 impl Entry {
@@ -246,6 +308,8 @@ impl Entry {
 /// A workspace snapshot with a bounded transcript page.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub worktrees: Vec<Worktree>,
     /// Daemon clock for rebasing short-lived events on clients with different clocks.
     #[serde(default)]
     pub server_time_ms: u64,
@@ -1281,6 +1345,18 @@ impl EngineTelemetry {
     }
 }
 
+/// One image delivered with a prompt: raw bytes, base64-encoded for the
+/// wire. The daemon materializes or forwards them per backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptImage {
+    /// Original file name when known (`paste.png` for clipboard images).
+    pub name: String,
+    /// MIME type (`image/png`, `image/jpeg`, …).
+    pub media_type: String,
+    /// Base64-encoded image bytes (standard alphabet, no line breaks).
+    pub data: String,
+}
+
 /// Commands accepted by the persistent daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1347,6 +1423,24 @@ pub enum Command {
         name: String,
         backend: Backend,
     },
+    DiscoverWorktrees {
+        workspace_id: String,
+        directory: String,
+    },
+    CreateWorktree {
+        source_id: String,
+        directory: String,
+        branch: String,
+        base: String,
+    },
+    RemoveWorktree {
+        worktree_id: String,
+    },
+    CreateWorktreeSession {
+        worktree_id: String,
+        name: String,
+        backend: Backend,
+    },
     MoveSession {
         session_id: String,
         workspace_id: String,
@@ -1359,6 +1453,10 @@ pub enum Command {
         session_id: String,
         request_id: String,
         text: String,
+        /// Images delivered with the prompt (bytes, not paths, so remote
+        /// daemon hosts receive them too). Absent in older clients.
+        #[serde(default)]
+        images: Vec<PromptImage>,
     },
     Stop {
         session_id: String,
@@ -1390,6 +1488,28 @@ pub struct Receipt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_without_images_field_still_deserializes() {
+        // Older clients send no `images`; the daemon must accept them.
+        let command: super::Command = serde_json::from_str(
+            r#"{"type":"prompt","session_id":"s","request_id":"r","text":"hi"}"#,
+        )
+        .expect("legacy prompt");
+        let super::Command::Prompt { images, .. } = command else {
+            panic!("expected prompt");
+        };
+        assert!(images.is_empty());
+        let with_image: super::Command = serde_json::from_str(
+            r#"{"type":"prompt","session_id":"s","request_id":"r","text":"hi","images":[{"name":"a.png","media_type":"image/png","data":"aGVsbG8="}]}"#,
+        )
+        .expect("prompt with image");
+        let super::Command::Prompt { images, .. } = with_image else {
+            panic!("expected prompt");
+        };
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+    }
+
     #[test]
     fn component_config_pages_bind_setters_to_the_authoritative_scope() {
         let field = super::EngineConfigField {

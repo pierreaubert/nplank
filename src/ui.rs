@@ -3,13 +3,14 @@
 // Rust guideline compliant 2026-02-21
 use crate::{
     client::Client,
-    model::{AgentProvider, Backend, Command, Session, Snapshot},
+    model::{AgentProvider, Backend, Command, PromptImage, Session, Snapshot},
 };
 use gpui::{App, Context, SharedString, Window, div, prelude::*, px};
-use gpui_design::{DesignExt, DesignSystem, DesignSystemState};
+use gpui_design::{DesignSystem, DesignSystemState};
 use gpui_ui_kit::theme::{ThemeState, ThemeVariant};
 use gpui_ui_kit::{
-    Button, ButtonSize, ButtonVariant, Input, Markdown, Progress, ProgressSize, QrCode, ThemeExt,
+    Button, ButtonSize, ButtonVariant, Checkbox, Input, Markdown, Progress, ProgressSize, QrCode,
+    RadioGroup, RadioOption, ThemeExt,
 };
 use gpui_ui_kit_macros::{ComponentTheme, layout};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod pane_tests;
+
 gpui::actions!(
     nplank,
     [
@@ -27,7 +31,14 @@ gpui::actions!(
         NewWorkspace,
         OpenPreferences,
         ToggleArchived,
-        OpenCommands
+        OpenCommands,
+        ToggleFleet,
+        ToggleCi,
+        ToggleDocs,
+        ToggleMonitor,
+        PairDevice,
+        NextAttention,
+        PasteImage
     ]
 );
 
@@ -71,6 +82,7 @@ struct WorkspaceTheme {
 
 #[derive(Debug)]
 enum Operation {
+    WorktreeChanges(String, uuid::Uuid),
     Select(Option<String>, i64),
     AsidePage(i64),
     Command(Command),
@@ -235,7 +247,15 @@ enum ActivityTab {
 }
 
 #[derive(Debug)]
+struct WorktreeInspection {
+    id: String,
+    request: uuid::Uuid,
+    result: Option<Result<crate::model::WorktreeChanges, String>>,
+}
+
+#[derive(Debug)]
 enum Update {
+    WorktreeChanges(uuid::Uuid, Result<crate::model::WorktreeChanges, String>),
     DocumentLoaded(
         Box<(
             DocumentLoad,
@@ -265,12 +285,99 @@ pub(crate) struct Preferences {
     #[serde(default)]
     collapsed: HashSet<String>,
     #[serde(default)]
+    closed_workspaces: HashSet<String>,
+    #[serde(default)]
+    collapsed_machines: HashSet<String>,
+    #[serde(default)]
     pending_prompts: HashMap<String, (String, String)>,
+    #[serde(default)]
+    sidebar_width: Option<f32>,
+    #[serde(default)]
+    navigation: crate::navigation::NavigationMode,
+    #[serde(default)]
+    keymap: gpui_keybinding::KeymapPreset,
+    #[serde(default)]
+    key_overrides: Vec<gpui_keybinding::DocumentedKeybinding>,
+    #[serde(default)]
+    diagnostics: bool,
+    #[serde(default)]
+    closed_tabs: HashSet<String>,
+    #[serde(default = "default_prometheus_url")]
+    prometheus_url: String,
+}
+
+/// Default Prometheus-like monitoring source (local Prometheus).
+fn default_prometheus_url() -> String {
+    "http://localhost:9090".into()
+}
+
+/// Payload for sidebar drag-to-reorder.
+#[derive(Debug, Clone)]
+struct SessionDrag {
+    id: String,
+    label: String,
+}
+
+/// A destructive action awaiting explicit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirm {
+    /// Kill and remove a running terminal (index into `terminals`).
+    CloseTerminal(usize),
+    /// Hide a workspace and its sessions from the sidebar.
+    CloseWorkspace(String),
+    /// Delete a dashboard JSON file from the workspace.
+    DeleteDashboard(String),
+    RemoveWorktree(String),
+}
+
+/// Which monitoring panel the editor form is editing, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonEdit {
+    /// A new panel appended on save.
+    New,
+    /// The existing panel at this index.
+    Existing(usize),
+}
+
+/// Floating preview shown while dragging a session row.
+struct SessionDragPreview {
+    label: String,
+}
+
+impl gpui::Render for SessionDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(5.0))
+            .bg(gpui::hsla(0.6, 0.25, 0.22, 0.95))
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(self.label.clone())
+    }
 }
 
 /// A responsive workspace shell with a background-only network bridge.
 #[derive(Debug)]
 pub struct WorkspaceView {
+    pane_client: Client,
+    pane_directory: PathBuf,
+    pane_parent: Option<gpui::WeakEntity<WorkspaceView>>,
+    pane_size: Option<gpui::Size<gpui::Pixels>>,
+    pane_splits: Vec<(bool, gpui::Entity<WorkspaceView>)>,
+
+    key_scope: String,
+    shortcuts: crate::shortcuts::ShortcutRegistry,
+    navigation_focus: gpui::FocusHandle,
+    workspace_focus: gpui::FocusHandle,
+    transcript_focus: gpui::FocusHandle,
+    question_focus: gpui::FocusHandle,
+    palette_focus: gpui::FocusHandle,
+    show_palette: bool,
+    show_shortcuts: bool,
+    palette_query: String,
+    palette_cursor: usize,
+    palette_scroll: gpui::ScrollHandle,
     notification_tracker: crate::notifications::Tracker,
     notification_delivery: crate::notifications::Delivery,
     document_pointer: std::rc::Rc<std::cell::RefCell<crate::editor_input::DocumentPointer>>,
@@ -289,6 +396,7 @@ pub struct WorkspaceView {
     frame_text_focus: gpui::FocusHandle,
     command_scroll: gpui::ScrollHandle,
     job_output_scroll: gpui::ScrollHandle,
+    transcript_scroll: HashMap<String, gpui::ScrollHandle>,
     command_cursor: usize,
     command_dismissed: bool,
     focus_commands: bool,
@@ -298,11 +406,23 @@ pub struct WorkspaceView {
     #[cfg(target_os = "macos")]
     meters: crate::utilization::Utilization,
     snapshot: Snapshot,
+    worktree_inspection: Option<WorktreeInspection>,
     selected: Option<String>,
     workspace: Option<String>,
     drafts: HashMap<String, String>,
+    attachments: HashMap<String, Vec<PathBuf>>,
+    session_menu: Option<(String, gpui::Point<gpui::Pixels>)>,
+    sidebar_width: f32,
+    sidebar_drag: bool,
+    show_preflight: bool,
+    preflight_confirmed: bool,
+    run_summaries: HashMap<String, (f64, u64)>,
+    was_busy: HashMap<String, bool>,
     pending_prompts: HashMap<String, (String, String)>,
     collapsed: HashSet<String>,
+    closed_workspaces: HashSet<String>,
+    collapsed_machines: HashSet<String>,
+    confirm: Option<Confirm>,
     fields: HashMap<String, String>,
     tx: mpsc::Sender<Operation>,
     rx: mpsc::Receiver<Update>,
@@ -316,6 +436,17 @@ pub struct WorkspaceView {
     frame_surfaces: HashMap<String, (crate::frame::Snapshot, gpui_ui_kit::scene2d::Scene2DState)>,
     frame_cursors: HashMap<String, (u16, u16)>,
     frame_expanded: HashSet<String>,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    terminals: Vec<crate::terminal::Terminal>,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    terminal_titles: Vec<String>,
+    /// Workspace each terminal belongs to (parallel to `terminals`).
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    terminal_workspaces: Vec<String>,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    active_terminal: Option<usize>,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    terminal_focus: gpui::FocusHandle,
     #[cfg(not(target_family = "wasm"))]
     preview_files: HashMap<String, tempfile::TempDir>,
     #[cfg(target_family = "wasm")]
@@ -330,6 +461,26 @@ pub struct WorkspaceView {
     show_archived: bool,
     details: bool,
     show_tasks: bool,
+    show_fleet: bool,
+    show_ci: bool,
+    ci_loading: bool,
+    ci_result: Option<Result<(crate::ci::CiProvider, Vec<crate::ci::CiRun>), String>>,
+    show_docs: bool,
+    markdown_files: Vec<PathBuf>,
+    markdown_current: Option<PathBuf>,
+    mon_label_keys: Vec<String>,
+    markdown_content: Option<Result<String, String>>,
+    tool_launchers: Vec<crate::tools::ToolLauncher>,
+    show_monitor: bool,
+    mon_dashboards: Vec<crate::dashboards::Dashboard>,
+    mon_current: Option<String>,
+    mon_data: HashMap<usize, Result<Vec<crate::prom::Series>, String>>,
+    mon_loading: bool,
+    mon_last_fetch: Option<std::time::Instant>,
+    mon_range_secs: i64,
+    mon_metrics: Option<Result<Vec<String>, String>>,
+    mon_edit: Option<MonEdit>,
+    mon_error: Option<String>,
     activity_tab: ActivityTab,
     history_checkpoints: bool,
     history_tree: bool,
@@ -454,6 +605,7 @@ impl WorkspaceView {
         if self.appearance_only {
             return;
         }
+        self.fields.remove("agent-worktree");
         self.workspace = workspace
             .or_else(|| self.workspace.clone())
             .or_else(|| self.snapshot.workspaces.first().map(|w| w.id.clone()));
@@ -495,6 +647,664 @@ impl WorkspaceView {
         self.show_archived = !self.show_archived;
         cx.notify();
     }
+
+    /// Whether the embedded terminal (not a session) owns the content area.
+    fn show_terminal(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            self.active_terminal.is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            false
+        }
+    }
+
+    /// Toggles the fleet overview (all sessions as glanceable cards).
+    /// Jumps to the next session needing the user (Fleet attention
+    /// order, cycling). Bound to Cmd+Shift+J and the top-bar chip.
+    pub fn go_next_attention(&mut self, cx: &mut Context<Self>) {
+        let queue = crate::usage::attention_queue(&self.snapshot);
+        if let Some(next) = crate::usage::next_attention(&queue, self.selected.as_deref()).cloned()
+        {
+            self.select(next.id);
+            self.show_fleet = false;
+            self.show_new = false;
+            self.appearance = false;
+            cx.notify();
+        }
+    }
+
+    /// Top-bar chips next to the CPU/GPU meters: who needs you next, and
+    /// per-provider live usage (derived; providers expose no quota API).
+    fn titlebar_chips(
+        &self,
+        colors: &WorkspaceTheme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut chips: Vec<gpui::AnyElement> = Vec::new();
+        let queue = crate::usage::attention_queue(&self.snapshot);
+        if let Some(next) = crate::usage::next_attention(&queue, self.selected.as_deref()).cloned()
+        {
+            let name: String = next.name.chars().take(18).collect();
+            chips.push(
+                Button::new(
+                    "next-attention",
+                    format!("⚑ {} need you · {} ({})", queue.len(), name, next.reason),
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Primary)
+                .on_click(click(cx, |view, _, cx| view.go_next_attention(cx)))
+                .into_any_element(),
+            );
+        }
+        for usage in crate::usage::provider_usage(&self.snapshot)
+            .into_iter()
+            .take(3)
+        {
+            let mut text = usage.label.clone();
+            if usage.running > 0 {
+                text.push_str(&format!(" ▶{}", usage.running));
+            }
+            text.push_str(&format!(
+                " {} tok",
+                crate::usage::format_tokens(usage.generated)
+            ));
+            if let Some(peak) = usage.ctx_peak
+                && peak >= 75
+            {
+                text.push_str(&format!(" · ctx {peak}%"));
+            }
+            chips.push(
+                div()
+                    .flex_shrink_0()
+                    .font_family("Menlo")
+                    .text_color(colors.muted)
+                    .child(text)
+                    .into_any_element(),
+            );
+        }
+        chips
+    }
+
+    pub fn toggle_fleet(&mut self, cx: &mut Context<Self>) {
+        self.show_fleet = !self.show_fleet;
+        if self.show_fleet {
+            self.show_ci = false;
+            self.show_docs = false;
+            self.show_monitor = false;
+        }
+        // The terminal panel outranks Fleet in the content stack; opening
+        // Fleet must close it or the toggle appears to do nothing.
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if self.show_fleet {
+            self.active_terminal = None;
+        }
+        cx.notify();
+    }
+
+    /// Directory of the workspace the CI board and Docs viewer describe:
+    /// the selected session's workspace, else the first workspace with a
+    /// directory, else the app's own directory.
+    fn workspace_directory(&self) -> PathBuf {
+        if let Some(tree) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.snapshot.sessions.iter().find(|s| &s.id == id))
+            .and_then(|s| s.worktree_id.as_ref())
+            .and_then(|id| self.snapshot.worktrees.iter().find(|tree| &tree.id == id))
+        {
+            return PathBuf::from(&tree.directory);
+        }
+        let from_workspace = |id: &str| {
+            self.snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id && !workspace.directory.is_empty())
+                .map(|workspace| PathBuf::from(&workspace.directory))
+        };
+        if let Some(session) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.snapshot.sessions.iter().find(|s| &s.id == id))
+            && let Some(dir) = from_workspace(&session.workspace_id)
+        {
+            return dir;
+        }
+        if let Some(dir) = self.workspace.as_deref().and_then(from_workspace) {
+            return dir;
+        }
+        if let Some(dir) = self
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| !workspace.directory.is_empty())
+            .map(|workspace| PathBuf::from(&workspace.directory))
+        {
+            return dir;
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.directory.clone()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            PathBuf::new()
+        }
+    }
+
+    /// Toggles the CI runs board, fetching on first open.
+    pub fn toggle_ci(&mut self, cx: &mut Context<Self>) {
+        self.show_ci = !self.show_ci;
+        if self.show_ci {
+            self.show_fleet = false;
+            self.show_docs = false;
+            self.show_monitor = false;
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            {
+                self.active_terminal = None;
+            }
+            if self.ci_result.is_none() && !self.ci_loading {
+                self.refresh_ci(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Fetches CI runs off the UI thread via `gh`/`tea`.
+    fn refresh_ci(&mut self, cx: &mut Context<Self>) {
+        if self.ci_loading {
+            return;
+        }
+        self.ci_loading = true;
+        let directory = self.workspace_directory();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::ci::fetch_runs(&directory) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.ci_loading = false;
+                view.ci_result = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Toggles the read-only Markdown viewer, rescanning on open.
+    pub fn toggle_docs(&mut self, cx: &mut Context<Self>) {
+        self.show_docs = !self.show_docs;
+        if self.show_docs {
+            self.show_fleet = false;
+            self.show_ci = false;
+            self.show_monitor = false;
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            {
+                self.active_terminal = None;
+            }
+            self.rescan_markdown();
+        }
+        cx.notify();
+    }
+
+    fn rescan_markdown(&mut self) {
+        self.markdown_files =
+            crate::markdown::find_markdown_files(&self.workspace_directory(), 200);
+        if self.markdown_current.is_none()
+            && let Some(first) = self.markdown_files.first().cloned()
+        {
+            self.open_markdown(first);
+        }
+    }
+
+    fn open_markdown(&mut self, path: PathBuf) {
+        self.markdown_content = Some(
+            std::fs::read_to_string(&path)
+                .map(|text| {
+                    if text.len() > 512_000 {
+                        format!(
+                            "{}\n\n… (truncated)",
+                            &text[..text.floor_char_boundary(512_000)]
+                        )
+                    } else {
+                        text
+                    }
+                })
+                .map_err(|error| format!("Could not read {}: {error}", path.display())),
+        );
+        self.markdown_current = Some(path);
+    }
+
+    /// Effective Prometheus source URL (empty preference means default).
+    fn prometheus_url(&self) -> String {
+        if self.preferences.prometheus_url.trim().is_empty() {
+            default_prometheus_url()
+        } else {
+            self.preferences.prometheus_url.trim().to_owned()
+        }
+    }
+
+    /// Toggles the monitoring dashboards, loading and fetching on open.
+    pub fn toggle_monitor(&mut self, cx: &mut Context<Self>) {
+        self.show_monitor = !self.show_monitor;
+        if self.show_monitor {
+            self.show_fleet = false;
+            self.show_ci = false;
+            self.show_docs = false;
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            {
+                self.active_terminal = None;
+            }
+            if !self.fields.contains_key("mon-prom-url") {
+                self.fields
+                    .insert("mon-prom-url".into(), self.prometheus_url());
+            }
+            self.reload_dashboards();
+            self.fetch_monitor(cx);
+            self.fetch_metrics(cx);
+        }
+        cx.notify();
+    }
+
+    fn reload_dashboards(&mut self) {
+        self.mon_dashboards = crate::dashboards::list(&self.workspace_directory());
+        if self
+            .mon_current
+            .as_ref()
+            .is_none_or(|name| !self.mon_dashboards.iter().any(|d| &d.name == name))
+        {
+            self.mon_current = self.mon_dashboards.first().map(|d| d.name.clone());
+        }
+        self.mon_edit = None;
+    }
+
+    fn current_dashboard(&self) -> Option<&crate::dashboards::Dashboard> {
+        self.mon_current.as_ref().and_then(|name| {
+            self.mon_dashboards
+                .iter()
+                .find(|dashboard| &dashboard.name == name)
+        })
+    }
+
+    /// Fetches every panel of the current dashboard off the UI thread.
+    fn fetch_monitor(&mut self, cx: &mut Context<Self>) {
+        if self.mon_loading {
+            return;
+        }
+        let Some(dashboard) = self.current_dashboard().cloned() else {
+            self.mon_data.clear();
+            return;
+        };
+        self.mon_loading = true;
+        self.mon_last_fetch = Some(std::time::Instant::now());
+        let base = self.prometheus_url();
+        let end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |age| age.as_secs() as i64);
+        let start = end - self.mon_range_secs;
+        let step = crate::prom::step_for_range(self.mon_range_secs);
+        let queries: Vec<String> = dashboard
+            .panels
+            .iter()
+            .map(|panel| panel.query.clone())
+            .collect();
+        cx.spawn(async move |view, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    queries
+                        .iter()
+                        .map(|query| crate::prom::fetch_range(&base, query, start, end, step))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.mon_loading = false;
+                view.mon_data = results.into_iter().enumerate().collect();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches the metric-name list for the browser, off the UI thread.
+    fn fetch_metrics(&mut self, cx: &mut Context<Self>) {
+        let base = self.prometheus_url();
+        cx.spawn(async move |view, cx| {
+            let metrics = cx
+                .background_executor()
+                .spawn(async move { crate::prom::fetch_metric_names(&base) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.mon_metrics = Some(metrics);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches label keys for one metric, to hint at usable filters.
+    fn fetch_metric_labels(&mut self, metric: String, cx: &mut Context<Self>) {
+        let base = self.prometheus_url();
+        cx.spawn(async move |view, cx| {
+            let labels = cx
+                .background_executor()
+                .spawn(async move { crate::prom::fetch_series_labels(&base, &metric) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.mon_label_keys = labels.map_or_else(
+                    |_| Vec::new(),
+                    |sets| {
+                        let mut keys: Vec<String> = sets
+                            .iter()
+                            .flat_map(|set| set.keys().cloned())
+                            .filter(|key| key != "__name__")
+                            .collect();
+                        keys.sort();
+                        keys.dedup();
+                        keys.truncate(12);
+                        keys
+                    },
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn mon_apply_url(&mut self, cx: &mut Context<Self>) {
+        let url = self.field("mon-prom-url");
+        self.preferences.prometheus_url = if url.trim().is_empty() {
+            default_prometheus_url()
+        } else {
+            url.trim().to_owned()
+        };
+        self.save_preferences();
+        self.mon_metrics = None;
+        self.fetch_monitor(cx);
+        self.fetch_metrics(cx);
+    }
+
+    fn mon_create_dashboard(&mut self, cx: &mut Context<Self>) {
+        let name = self.field("mon-dash-name");
+        let name = if name.trim().is_empty() {
+            "Dashboard".to_owned()
+        } else {
+            name.trim().to_owned()
+        };
+        let dashboard = crate::dashboards::Dashboard {
+            name: name.clone(),
+            panels: Vec::new(),
+        };
+        match crate::dashboards::save(&self.workspace_directory(), &dashboard) {
+            Ok(_) => {
+                self.mon_error = None;
+                self.mon_current = Some(name);
+                self.reload_dashboards();
+                self.fetch_monitor(cx);
+            }
+            Err(error) => self.mon_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn mon_open_panel_editor(&mut self, edit: MonEdit, prefill_query: Option<String>) {
+        let panel = match edit {
+            MonEdit::Existing(index) => self
+                .current_dashboard()
+                .and_then(|dashboard| dashboard.panels.get(index).cloned()),
+            MonEdit::New => None,
+        };
+        if let Some(panel) = panel {
+            self.fields.insert("mon-panel-title".into(), panel.title);
+            self.fields.insert("mon-panel-query".into(), panel.query);
+            self.fields
+                .insert("mon-panel-kind".into(), panel.kind.label().into());
+            self.fields.insert("mon-panel-unit".into(), panel.unit);
+        } else {
+            self.fields.insert(
+                "mon-panel-title".into(),
+                prefill_query.clone().unwrap_or_default(),
+            );
+            self.fields
+                .insert("mon-panel-query".into(), prefill_query.unwrap_or_default());
+            self.fields.insert("mon-panel-kind".into(), "Line".into());
+            self.fields.insert("mon-panel-unit".into(), String::new());
+        }
+        self.mon_edit = Some(edit);
+        self.mon_error = None;
+    }
+
+    fn mon_save_panel(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.mon_edit else {
+            return;
+        };
+        let kind = crate::dashboards::PanelKind::ALL
+            .iter()
+            .find(|kind| kind.label() == self.field("mon-panel-kind"))
+            .copied()
+            .unwrap_or(crate::dashboards::PanelKind::Line);
+        let panel = crate::dashboards::Panel {
+            title: self.field("mon-panel-title").trim().to_owned(),
+            kind,
+            query: self.field("mon-panel-query").trim().to_owned(),
+            unit: self.field("mon-panel-unit").trim().to_owned(),
+        };
+        let Some(mut dashboard) = self.current_dashboard().cloned() else {
+            return;
+        };
+        match edit {
+            MonEdit::New => dashboard.panels.push(panel),
+            MonEdit::Existing(index) => {
+                if let Some(slot) = dashboard.panels.get_mut(index) {
+                    *slot = panel;
+                }
+            }
+        }
+        match crate::dashboards::save(&self.workspace_directory(), &dashboard) {
+            Ok(_) => {
+                self.mon_error = None;
+                self.mon_edit = None;
+                self.reload_dashboards();
+                self.fetch_monitor(cx);
+            }
+            Err(error) => self.mon_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn mon_delete_panel(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(mut dashboard) = self.current_dashboard().cloned() else {
+            return;
+        };
+        if index < dashboard.panels.len() {
+            dashboard.panels.remove(index);
+        }
+        match crate::dashboards::save(&self.workspace_directory(), &dashboard) {
+            Ok(_) => {
+                self.mon_error = None;
+                self.reload_dashboards();
+                self.fetch_monitor(cx);
+            }
+            Err(error) => self.mon_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Opens the iOS pairing dialog (same local-only panel as `/pair`).
+    pub fn pair_device(&mut self, cx: &mut Context<Self>) {
+        self.show_pair = true;
+        self.show_new = false;
+        cx.notify();
+    }
+
+    /// Attaches existing files to a session's next prompt.
+    /// (Images among them are sent as bytes on submit; see `prompt_image_for`.)
+    ///
+    /// Directories and missing paths are rejected with an inline error;
+    /// duplicates are ignored. Attachments ride the next prompt as a
+    /// manifest the engine can read, then clear.
+    pub fn attach_files(&mut self, session_id: &str, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut rejected = 0usize;
+        let entry = self.attachments.entry(session_id.to_owned()).or_default();
+        for path in paths {
+            if path.is_file() {
+                if !entry.contains(&path) {
+                    entry.push(path);
+                }
+            } else {
+                rejected += 1;
+            }
+        }
+        if rejected > 0 {
+            self.error = Some(format!(
+                "{rejected} dropped item(s) were not files and were skipped"
+            ));
+        } else {
+            self.error = None;
+        }
+        cx.notify();
+    }
+
+    /// Attaches an image from the clipboard (written under the app data
+    /// directory) to the selected session. Returns false when the
+    /// clipboard holds no image, so normal text paste can proceed.
+    pub fn paste_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.selected.clone() else {
+            return false;
+        };
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        for entry in &item.entries {
+            let gpui::ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
+            let ext = match image.format {
+                gpui::ImageFormat::Png => "png",
+                gpui::ImageFormat::Jpeg => "jpg",
+                gpui::ImageFormat::Gif => "gif",
+                gpui::ImageFormat::Svg => "svg",
+                gpui::ImageFormat::Tiff => "tiff",
+                gpui::ImageFormat::Bmp => "bmp",
+                gpui::ImageFormat::Webp => "webp",
+                gpui::ImageFormat::Ico => "ico",
+                gpui::ImageFormat::Pnm => "pnm",
+            };
+            let dir = self.directory.join("pasted-images");
+            if std::fs::create_dir_all(&dir).is_err() {
+                return false;
+            }
+            let path = dir.join(format!("paste-{}.{ext}", uuid::Uuid::new_v4()));
+            if std::fs::write(&path, image.bytes()).is_err() {
+                return false;
+            }
+            self.attach_files(&session_id, vec![path], cx);
+            return true;
+        }
+        false
+    }
+
+    /// Opens the native file picker to attach files to the selected session.
+    pub fn attach_via_picker(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+            initial_directory: None,
+            extensions: Vec::new(),
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && !paths.is_empty()
+            {
+                let _ = view.update(cx, |view, cx| {
+                    view.attach_files(&session_id, paths, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Moves the selected session within its workspace (`-1` up, `+1` down)
+    /// by swapping sidebar positions with its neighbour.
+    pub fn move_selected(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == selected)
+        else {
+            return;
+        };
+        let workspace_id = session.workspace_id.clone();
+        let mut siblings: Vec<&Session> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|session| session.workspace_id == workspace_id && !session.archived)
+            .collect();
+        siblings.sort_by_key(|session| session.position);
+        let Some(index) = siblings.iter().position(|session| session.id == selected) else {
+            return;
+        };
+        let target = index as i64 + delta;
+        if target < 0 || target >= siblings.len() as i64 {
+            return;
+        }
+        let neighbour_id = siblings[target as usize].id.clone();
+        self.swap_positions(&selected, &neighbour_id);
+        cx.notify();
+    }
+
+    /// Swaps the sidebar positions of two sessions in the same workspace.
+    fn swap_positions(&mut self, first: &str, second: &str) {
+        if first == second {
+            return;
+        }
+        let positions: Vec<(String, i64)> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|session| session.id == first || session.id == second)
+            .map(|session| (session.id.clone(), session.position))
+            .collect();
+        if positions.len() != 2 || positions[0].1 == positions[1].1 {
+            return;
+        }
+        let (first_position, second_position) = (positions[0].1, positions[1].1);
+        self.command(Command::ReorderSession {
+            session_id: first.to_owned(),
+            position: second_position,
+        });
+        self.command(Command::ReorderSession {
+            session_id: second.to_owned(),
+            position: first_position,
+        });
+    }
+
+    /// Drops a dragged session onto a target row (drag reorder).
+    pub fn reorder_onto(&mut self, dragged: &str, target: &str, cx: &mut Context<Self>) {
+        let workspace_of = |id: &str| {
+            self.snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| session.workspace_id.clone())
+        };
+        if workspace_of(dragged).is_some() && workspace_of(dragged) == workspace_of(target) {
+            self.swap_positions(dragged, target);
+            cx.notify();
+        }
+    }
     /// Creates a view and starts its independent network bridge.
     pub fn new(
         client: Client,
@@ -523,8 +1333,24 @@ impl WorkspaceView {
         preferences: Preferences,
         cx: &mut Context<Self>,
     ) -> Self {
+        let key_scope = format!("Nplank{}", uuid::Uuid::new_v4().simple());
+        let configured = crate::shortcuts::registry(
+            &key_scope,
+            preferences.keymap,
+            preferences.key_overrides.clone(),
+        );
+        let key_error = configured
+            .as_ref()
+            .err()
+            .map(|error| format!("Keyboard settings: {error}"));
+        let shortcuts = configured.unwrap_or_else(|_| {
+            crate::shortcuts::registry(&key_scope, gpui_keybinding::KeymapPreset::Default, vec![])
+                .expect("built-in shortcuts are valid")
+        });
+        crate::shortcuts::install(&key_scope, None, &shortcuts, preferences.keymap, cx);
         #[cfg(target_family = "wasm")]
         let _ = &directory;
+        let pane_client = client.clone();
         let pairing_payload = client.pairing_payload();
         let focus_pending = Arc::new(Mutex::new(None));
         let (tx, rx) = if appearance {
@@ -579,6 +1405,23 @@ impl WorkspaceView {
         })
         .detach();
         let view = Self {
+            pane_client,
+            pane_directory: directory.clone(),
+            pane_parent: None,
+            pane_size: None,
+            pane_splits: Vec::new(),
+            key_scope,
+            shortcuts,
+            navigation_focus: cx.focus_handle(),
+            workspace_focus: cx.focus_handle(),
+            transcript_focus: cx.focus_handle(),
+            question_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            show_palette: false,
+            show_shortcuts: false,
+            palette_query: String::new(),
+            palette_cursor: 0,
+            palette_scroll: gpui::ScrollHandle::new(),
             buddy_image: None,
             focus_pending,
             focus_client: uuid::Uuid::new_v4().to_string(),
@@ -592,8 +1435,19 @@ impl WorkspaceView {
             task_form_focus: cx.focus_handle(),
             conversation_form_focus: cx.focus_handle(),
             frame_text_focus: cx.focus_handle(),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            terminals: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            terminal_titles: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            terminal_workspaces: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            active_terminal: None,
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            terminal_focus: cx.focus_handle(),
             command_scroll: gpui::ScrollHandle::new(),
             job_output_scroll: gpui::ScrollHandle::new(),
+            transcript_scroll: HashMap::new(),
             command_cursor: 0,
             command_dismissed: false,
             focus_commands: false,
@@ -602,19 +1456,31 @@ impl WorkspaceView {
             #[cfg(target_os = "macos")]
             meters: crate::utilization::Utilization::default(),
             snapshot: Snapshot::default(),
+            worktree_inspection: None,
             selected: preferences.selected.clone(),
             workspace: None,
             drafts: preferences.drafts.clone(),
+            attachments: HashMap::new(),
+            session_menu: None,
+            sidebar_width: preferences.sidebar_width.unwrap_or(0.0),
+            sidebar_drag: false,
+            show_preflight: false,
+            preflight_confirmed: false,
+            run_summaries: HashMap::new(),
+            was_busy: HashMap::new(),
             documents: preferences.documents.clone(),
             notification_tracker: Default::default(),
             notification_delivery: Default::default(),
             document_pointer: Default::default(),
             pending_prompts: preferences.pending_prompts.clone(),
             collapsed: preferences.collapsed.clone(),
+            closed_workspaces: preferences.closed_workspaces.clone(),
+            collapsed_machines: preferences.collapsed_machines.clone(),
+            confirm: None,
             fields,
             tx,
             rx,
-            error: None,
+            error: key_error,
             connected: false,
             export_jobs: HashSet::new(),
             document_jobs: HashMap::new(),
@@ -638,6 +1504,26 @@ impl WorkspaceView {
             show_archived: false,
             details: false,
             show_tasks: false,
+            show_fleet: false,
+            show_ci: false,
+            ci_loading: false,
+            ci_result: None,
+            show_docs: false,
+            markdown_files: Vec::new(),
+            markdown_current: None,
+            mon_label_keys: Vec::new(),
+            markdown_content: None,
+            tool_launchers: crate::tools::available_tools(),
+            show_monitor: false,
+            mon_dashboards: Vec::new(),
+            mon_current: None,
+            mon_data: HashMap::new(),
+            mon_loading: false,
+            mon_last_fetch: None,
+            mon_range_secs: 3_600,
+            mon_metrics: None,
+            mon_edit: None,
+            mon_error: None,
             activity_tab: ActivityTab::Tasks,
             history_checkpoints: true,
             history_tree: false,
@@ -677,12 +1563,110 @@ impl WorkspaceView {
 
     fn poll(&mut self, cx: &mut Context<Self>) {
         self.publish_view_focus();
+        // Monitoring auto-refresh: refetch every 30s while visible.
+        if self.show_monitor
+            && !self.mon_loading
+            && self
+                .mon_last_fetch
+                .is_some_and(|fetched| fetched.elapsed() >= Duration::from_secs(30))
+        {
+            self.fetch_monitor(cx);
+        }
         let mut changed = false;
         #[cfg(target_os = "macos")]
         {
             let sample = self.utilization.sample();
             changed |= self.meters != sample;
             self.meters = sample;
+            let attention = self
+                .snapshot
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.attention || session.recovery_required || !session.approvals.is_empty()
+                })
+                .count();
+            crate::dock::set_attention_count(attention);
+            let running = self
+                .snapshot
+                .sessions
+                .iter()
+                .filter(|session| session.state.busy())
+                .count();
+            let label = match (running, attention) {
+                (0, 0) => "nplank".to_owned(),
+                (running, 0) => format!("nplank · {running} running"),
+                (0, attention) => format!("nplank · {attention} need attention"),
+                (running, attention) => {
+                    format!("nplank · {running} running · {attention} need attention")
+                }
+            };
+            nplank_macos_shim::set_status_label(&label);
+            for action in nplank_macos_shim::drain_actions() {
+                changed = true;
+                match action {
+                    nplank_macos_shim::StatusAction::Open => cx.activate(true),
+                    nplank_macos_shim::StatusAction::StopAll => {
+                        let busy: Vec<String> = self
+                            .snapshot
+                            .sessions
+                            .iter()
+                            .filter(|session| session.state.busy())
+                            .map(|session| session.id.clone())
+                            .collect();
+                        for session_id in busy {
+                            self.command(Command::Stop { session_id });
+                        }
+                    }
+                    nplank_macos_shim::StatusAction::Quit => cx.quit(),
+                }
+            }
+            for session_id in nplank_macos_shim::drain_notification_clicks() {
+                if self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == session_id)
+                {
+                    self.select(session_id);
+                    cx.activate(true);
+                    changed = true;
+                }
+            }
+        }
+        // Capture a one-line summary when a run finishes (busy -> idle).
+        for session in &self.snapshot.sessions {
+            let busy = session.state.busy();
+            if self.was_busy.insert(session.id.clone(), busy) == Some(true) && !busy {
+                if let Some(status) = self
+                    .snapshot
+                    .telemetry
+                    .get(&session.id)
+                    .and_then(|telemetry| telemetry.status.as_ref())
+                {
+                    self.run_summaries
+                        .insert(session.id.clone(), (status.elapsed_secs, status.generated));
+                }
+                changed = true;
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            for (index, terminal) in self.terminals.iter().enumerate() {
+                for event in terminal.drain_events() {
+                    match event {
+                        crate::terminal::TerminalEvent::Title(title) => {
+                            if let Some(slot) = self.terminal_titles.get_mut(index) {
+                                *slot = title;
+                            }
+                            changed = true;
+                        }
+                        crate::terminal::TerminalEvent::Wakeup
+                        | crate::terminal::TerminalEvent::Exited => changed = true,
+                        crate::terminal::TerminalEvent::WriteBack(_) => {}
+                    }
+                }
+            }
         }
         if self.draft_dirty {
             self.save_preferences();
@@ -701,9 +1685,7 @@ impl WorkspaceView {
                 if let Some(saved) = &saved
                     && let Ok(preferences) = serde_json::from_str::<Preferences>(saved)
                 {
-                    self.preferences.theme = preferences.theme;
-                    self.preferences.design = preferences.design;
-                    self.apply_appearance(cx);
+                    self.adopt_shared_preferences(preferences, cx);
                     changed = true;
                 }
                 self.preferences_saved = saved;
@@ -718,15 +1700,27 @@ impl WorkspaceView {
                 if let Ok(bytes) = std::fs::read(self.directory.join("preferences.json"))
                     && let Ok(preferences) = serde_json::from_slice::<Preferences>(&bytes)
                 {
-                    self.preferences.theme = preferences.theme;
-                    self.preferences.design = preferences.design;
-                    self.apply_appearance(cx);
+                    self.adopt_shared_preferences(preferences, cx);
                     changed = true;
                 }
                 self.preferences_modified = modified;
             }
         }
-        while let Ok(update) = self.rx.try_recv() {
+        loop {
+            let update = match self.rx.try_recv() {
+                Ok(update) => update,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // A dead bridge thread would otherwise leave the view
+                    // on "Connecting to Plank daemon…" forever.
+                    self.connected = false;
+                    if self.error.is_none() {
+                        self.error = Some("Connection worker stopped; reopen the window".into());
+                    }
+                    changed = true;
+                    break;
+                }
+            };
             changed = true;
             match update {
                 Update::Snapshot(selected, before, aside_before, mut snapshot) => {
@@ -752,7 +1746,9 @@ impl WorkspaceView {
                         crate::notifications::now_ms(),
                         |id| focused && viewed.as_deref() == Some(id),
                     ) {
-                        self.notification_delivery.send(notice);
+                        if self.pane_parent.is_none() {
+                            self.notification_delivery.send(notice);
+                        }
                     }
                     if selected == self.selected {
                         // A polling response may arrive after either page was changed.
@@ -852,7 +1848,10 @@ impl WorkspaceView {
                         })
                     });
                     if self.selected.is_none()
-                        && let Some(session) = self.snapshot.sessions.iter().find(|s| !s.archived)
+                        && let Some(session) =
+                            self.snapshot.sessions.iter().find(|s| {
+                                !s.archived && !self.preferences.closed_tabs.contains(&s.id)
+                            })
                     {
                         self.select(session.id.clone());
                     }
@@ -880,6 +1879,13 @@ impl WorkspaceView {
                                 self.document_errors.insert(request.key, error);
                             }
                         }
+                    }
+                }
+                Update::WorktreeChanges(request, result) => {
+                    if let Some(inspection) = &mut self.worktree_inspection
+                        && inspection.request == request
+                    {
+                        inspection.result = Some(result);
                     }
                 }
                 Update::Error(error) => {
@@ -1102,6 +2108,7 @@ impl WorkspaceView {
     }
 
     fn select(&mut self, id: String) {
+        self.preferences.closed_tabs.remove(&id);
         self.command(Command::AcknowledgeSession {
             session_id: id.clone(),
         });
@@ -1111,8 +2118,18 @@ impl WorkspaceView {
             .iter()
             .find(|s| s.id == id)
             .map(|s| s.workspace_id.clone());
+        // Selecting a session (e.g. from Machines) reopens its workspace.
+        if let Some(workspace_id) = self.workspace.clone()
+            && self.closed_workspaces.remove(&workspace_id)
+        {
+            self.save_preferences();
+        }
         self.selected = Some(id.clone());
         self.show_tasks = false;
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            self.active_terminal = None;
+        }
         let has_frame = self
             .snapshot
             .telemetry
@@ -1529,15 +2546,49 @@ impl WorkspaceView {
                 self.show_tasks = true;
             }
         }
+        // Risky prompts pause for preflight confirmation first; the draft
+        // and attachments survive the round trip untouched.
+        if !self.preflight_confirmed
+            && self
+                .current_preflight(&id)
+                .is_some_and(|info| crate::preflight::needs_preflight(&info))
+        {
+            self.show_preflight = true;
+            return;
+        }
+        // Attached images travel as bytes in the command (each backend
+        // materializes or forwards them); other files keep the path
+        // manifest. Chips clear once the prompt is sent.
+        let mut images: Vec<PromptImage> = Vec::new();
+        let mut others: Vec<PathBuf> = Vec::new();
+        if let Some(files) = self.attachments.remove(&id) {
+            for file in files {
+                match prompt_image_for(&file) {
+                    Some(image) => images.push(image),
+                    None => others.push(file),
+                }
+            }
+        }
+        let text = if others.is_empty() {
+            text
+        } else {
+            let mut manifest = String::from("Attached files:\n");
+            for file in &others {
+                manifest.push_str(&format!("- {}\n", file.display()));
+            }
+            manifest.push('\n');
+            manifest.push_str(&text);
+            manifest
+        };
         self.save_preferences();
         self.command(Command::Prompt {
             session_id: id.clone(),
             request_id,
             text,
+            images,
         });
         // Keep the draft until the user changes it, including after a rejected command.
     }
-
     fn field(&self, name: &str) -> String {
         self.fields.get(name).cloned().unwrap_or_default()
     }
@@ -1576,19 +2627,502 @@ impl WorkspaceView {
                     && !self.controls().iter().any(|command| command.name == draft)))
     }
 
+    fn execute_ui_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match name {
+            "Split right" => self.split_pane(true, window, cx),
+            "Split down" => self.split_pane(false, window, cx),
+            "Close pane" => self.close_pane(cx),
+            "Command palette" => {
+                self.show_palette = true;
+                self.palette_query.clear();
+                self.palette_cursor = 0;
+                self.palette_focus.focus(window, cx);
+            }
+            "Keyboard shortcuts" => {
+                self.show_shortcuts = true;
+            }
+            "Toggle navigator" => {
+                let sidebar = if self.sidebar_width > 0.0 {
+                    self.sidebar_width
+                } else {
+                    270.0
+                };
+                if self
+                    .preferences
+                    .navigation
+                    .docked(f32::from(window.viewport_size().width), sidebar)
+                {
+                    self.preferences.navigation = crate::navigation::NavigationMode::Hidden;
+                    self.mobile_sidebar = false;
+                    self.save_preferences();
+                    self.composer_focus.focus(window, cx);
+                } else {
+                    self.mobile_sidebar = !self.mobile_sidebar;
+                    if self.mobile_sidebar {
+                        self.navigation_focus.focus(window, cx);
+                    } else {
+                        self.composer_focus.focus(window, cx);
+                    }
+                }
+            }
+            "Focus composer" | "Open selected conversation" => {
+                self.mobile_sidebar = false;
+                self.composer_focus.focus(window, cx);
+            }
+            "Focus transcript" => {
+                self.transcript_focus.focus(window, cx);
+            }
+            "Focus pending question" => {
+                if self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.snapshot.sessions.iter().find(|s| &s.id == id))
+                    .is_some_and(|session| {
+                        session
+                            .approvals
+                            .iter()
+                            .any(|approval| approval.requirement["kind"] != "plank_editor")
+                    })
+                {
+                    self.question_focus.focus(window, cx);
+                }
+            }
+            "Next session" | "Previous session" | "Next worktree" | "Previous worktree"
+            | "Next project" | "Previous project" | "Navigator next" | "Navigator previous" => {
+                self.navigate_conversation(name, window, cx);
+            }
+            "Transcript page up"
+            | "Transcript page down"
+            | "Transcript start"
+            | "Transcript end" => {
+                if let Some(scroll) = self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.transcript_scroll.get(id))
+                {
+                    let mut offset = scroll.offset();
+                    let page = window.viewport_size().height * 0.7;
+                    offset.y = match name {
+                        "Transcript start" => px(0.0),
+                        "Transcript end" => -scroll.max_offset().y,
+                        "Transcript page up" => (offset.y + page).min(px(0.0)),
+                        _ => (offset.y - page).max(-scroll.max_offset().y),
+                    };
+                    scroll.set_offset(offset);
+                }
+            }
+            "New agent" => self.add_agent(None, cx),
+            "New workspace" => self.add_workspace(cx),
+            "Preferences" => self.open_preferences(cx),
+            "Engine commands" => self.open_commands(cx),
+            "Next needs attention" => self.go_next_attention(cx),
+            "Toggle fleet" => self.toggle_fleet(cx),
+            "Toggle CI" => self.toggle_ci(cx),
+            "Toggle docs" => self.toggle_docs(cx),
+            "Toggle monitor" => self.toggle_monitor(cx),
+            "Paste image" => {
+                self.paste_clipboard_image(cx);
+            }
+            "Toggle details" => {
+                self.details = !self.details;
+            }
+            "Toggle diagnostics" => {
+                self.preferences.diagnostics = !self.preferences.diagnostics;
+                self.save_preferences();
+            }
+            "Show archived sessions" => self.toggle_archived(cx),
+            "Projects and worktrees" => {
+                if let Some(workspace) = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|id| self.snapshot.workspaces.iter().find(|w| &w.id == id))
+                    .or_else(|| self.snapshot.workspaces.first())
+                {
+                    self.fields
+                        .insert("worktree-workspace".into(), workspace.id.clone());
+                    self.fields
+                        .insert("worktree-discover".into(), workspace.directory.clone());
+                } else {
+                    self.error = Some("Create a workspace first".into());
+                }
+            }
+            "Close session tab" => {
+                if let Some(id) = self.selected.take() {
+                    self.preferences.closed_tabs.insert(id);
+                    let next = self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .find(|s| !s.archived && !self.preferences.closed_tabs.contains(&s.id))
+                        .map(|s| s.id.clone());
+                    if let Some(id) = next {
+                        self.select(id);
+                    } else {
+                        self.preferences.selected = None;
+                    }
+                    self.save_preferences();
+                }
+            }
+            "Reopen closed tabs" => {
+                self.preferences.closed_tabs.clear();
+                self.save_preferences();
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn navigate_conversation(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let project_key = |session: &Session| {
+            (
+                session.workspace_id.clone(),
+                crate::navigation::session_group_worktree(&self.snapshot, session)
+                    .map(|tree| tree.project_id.clone()),
+            )
+        };
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.snapshot.sessions.iter().find(|s| &s.id == id));
+        let mut sessions: Vec<_> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|s| !s.archived && !self.preferences.closed_tabs.contains(&s.id))
+            .collect();
+        let tree_key = |session: &Session| {
+            crate::navigation::session_group_worktree(&self.snapshot, session)
+                .map(|tree| tree.id.clone())
+                .or_else(|| session.worktree_id.clone())
+        };
+        sessions.sort_by_key(|s| (project_key(s), tree_key(s), s.position));
+        if name.contains("session")
+            && let Some(current) = current
+        {
+            sessions.retain(|s| {
+                s.workspace_id == current.workspace_id && tree_key(s) == tree_key(current)
+            });
+        }
+        let previous = name.starts_with("Previous") || name.ends_with("previous");
+        let index = sessions
+            .iter()
+            .position(|s| Some(&s.id) == self.selected.as_ref())
+            .unwrap_or_else(|| {
+                if previous {
+                    0
+                } else {
+                    sessions.len().saturating_sub(1)
+                }
+            });
+        let next = (1..=sessions.len())
+            .map(|step| {
+                if previous {
+                    (index + sessions.len() - step) % sessions.len()
+                } else {
+                    (index + step) % sessions.len()
+                }
+            })
+            .map(|index| sessions[index])
+            .find(|session| {
+                current.is_none_or(|current| {
+                    if name.contains("worktree") {
+                        (session.workspace_id.as_str(), tree_key(session))
+                            != (current.workspace_id.as_str(), tree_key(current))
+                    } else if name.contains("project") {
+                        project_key(session) != project_key(current)
+                    } else {
+                        true
+                    }
+                })
+            })
+            .map(|s| s.id.clone());
+        if let Some(id) = next {
+            let overlay = self.mobile_sidebar;
+            self.select(id);
+            if name.starts_with("Navigator") {
+                self.mobile_sidebar = overlay;
+                self.navigation_focus.focus(window, cx);
+            }
+        }
+    }
+
+    fn apply_shortcuts(
+        &mut self,
+        preset: gpui_keybinding::KeymapPreset,
+        overrides: Vec<gpui_keybinding::DocumentedKeybinding>,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::shortcuts::registry(&self.key_scope, preset, overrides.clone()) {
+            Ok(registry) => {
+                crate::shortcuts::install(
+                    &self.key_scope,
+                    Some(&self.shortcuts),
+                    &registry,
+                    preset,
+                    cx,
+                );
+                self.shortcuts = registry;
+                self.preferences.keymap = preset;
+                self.preferences.key_overrides = overrides;
+                self.error = None;
+                self.save_preferences();
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn adopt_shared_preferences(&mut self, preferences: Preferences, cx: &mut Context<Self>) {
+        self.preferences.theme = preferences.theme;
+        self.preferences.design = preferences.design;
+        self.preferences.diagnostics = preferences.diagnostics;
+        if self.preferences.keymap != preferences.keymap
+            || self.preferences.key_overrides != preferences.key_overrides
+        {
+            match crate::shortcuts::registry(
+                &self.key_scope,
+                preferences.keymap,
+                preferences.key_overrides.clone(),
+            ) {
+                Ok(registry) => {
+                    crate::shortcuts::install(
+                        &self.key_scope,
+                        Some(&self.shortcuts),
+                        &registry,
+                        preferences.keymap,
+                        cx,
+                    );
+                    self.shortcuts = registry;
+                    self.preferences.keymap = preferences.keymap;
+                    self.preferences.key_overrides = preferences.key_overrides;
+                }
+                Err(error) => self.error = Some(format!("Keyboard settings: {error}")),
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.preferences_base.keymap = self.preferences.keymap;
+            self.preferences_base.key_overrides = self.preferences.key_overrides.clone();
+            self.preferences_base.diagnostics = self.preferences.diagnostics;
+        }
+        self.apply_appearance(cx);
+    }
+
+    fn app_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let weak = cx.entity().downgrade();
+        let mut results = div()
+            .id("app-palette-results")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(380.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.palette_scroll);
+        for (index, entry) in self
+            .shortcuts
+            .search_command_palette_cached(self.preferences.keymap, &self.palette_query)
+            .iter()
+            .enumerate()
+        {
+            let name = entry.description.clone();
+            results = results.child(
+                Button::new(
+                    SharedString::from(format!("app-command-{index}")),
+                    format!("{}    {}", entry.description, entry.key),
+                )
+                .full_width(true)
+                .selected(index == self.palette_cursor)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, window, cx| {
+                    view.show_palette = false;
+                    view.execute_ui_command(&name, window, cx);
+                })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child("Command palette")
+            .child(
+                self.scoped_input("app-palette-query")
+                    .value(self.palette_query.clone())
+                    .placeholder("Find an action…")
+                    .focus_handle(self.palette_focus.clone())
+                    .on_text_change(move |text, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.palette_query = text.into();
+                            view.palette_cursor = 0;
+                            view.palette_scroll.scroll_to_item(0);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(results)
+            .into_any_element()
+    }
+
+    fn shortcuts_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut presets = div().flex().flex_wrap().gap_2();
+        for &preset in gpui_keybinding::KeymapPreset::all() {
+            presets = presets.child(
+                Button::new(
+                    SharedString::from(format!("preset-{}", preset.name())),
+                    preset.name(),
+                )
+                .selected(self.preferences.keymap == preset)
+                .on_click(click(cx, move |view, _, cx| {
+                    view.apply_shortcuts(preset, view.preferences.key_overrides.clone(), cx);
+                })),
+            );
+        }
+        let mut panel = div().flex().flex_col().gap_3()
+            .child(div().flex().justify_between().child("Keyboard shortcuts")
+                .child(Button::new("close-shortcuts", "Close").on_click(click(cx, |view, _, cx| { view.show_shortcuts = false; cx.notify(); }))))
+            .child(presets).child(div().text_sm().child("Vim and Emacs navigation applies while the navigator has focus. Text editing keeps its own shortcuts."));
+        if let Some(error) = &self.error {
+            panel = panel.child(div().text_color(cx.theme().error).child(error.clone()));
+        }
+        let selected = self.field("shortcut-command");
+        if !selected.is_empty() {
+            panel = panel
+                .child(div().child(format!("Shortcut for {selected}")))
+                .child(self.input(
+                    "shortcut-spec",
+                    "e.g. ctrl-alt-b; leave empty to unbind",
+                    cx,
+                ))
+                .child(
+                    Button::new("save-shortcut", "Apply shortcut").on_click(click(
+                        cx,
+                        |view, _, cx| {
+                            let name = view.field("shortcut-command");
+                            let binding = view
+                                .shortcuts
+                                .get_documented(view.preferences.keymap)
+                                .iter()
+                                .find(|binding| binding.description == name)
+                                .cloned();
+                            if let Some(mut binding) = binding {
+                                binding.raw_key_spec =
+                                    Some(view.field("shortcut-spec").trim().into());
+                                let mut overrides = view.preferences.key_overrides.clone();
+                                overrides.retain(|entry| entry.description != name);
+                                overrides.push(binding);
+                                view.apply_shortcuts(view.preferences.keymap, overrides, cx);
+                            }
+                        },
+                    )),
+                );
+        }
+        panel = panel.child(
+            Button::new("reset-shortcuts", "Reset overrides")
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, |view, _, cx| {
+                    view.apply_shortcuts(view.preferences.keymap, vec![], cx);
+                })),
+        );
+        for (index, binding) in self
+            .shortcuts
+            .get_documented(self.preferences.keymap)
+            .iter()
+            .enumerate()
+        {
+            let name = binding.description.clone();
+            let spec = binding.raw_key_spec.clone().unwrap_or_default();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().child(binding.description.clone()))
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("edit-shortcut-{index}")),
+                            binding.key.clone(),
+                        )
+                        .size(ButtonSize::Xs)
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.fields.insert("shortcut-command".into(), name.clone());
+                            view.fields.insert("shortcut-spec".into(), spec.clone());
+                            cx.notify();
+                        })),
+                    ),
+            );
+        }
+        panel.into_any_element()
+    }
+
     fn control_key(
         &mut self,
         event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = event.keystroke.key.as_str();
-        #[cfg(not(target_os = "macos"))]
-        if key == "p"
-            && event.keystroke.modifiers.shift
-            && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+        if self
+            .pane_splits
+            .iter()
+            .any(|(_, pane)| pane.read(cx).workspace_focus.contains_focused(window, cx))
         {
-            self.open_commands(cx);
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if self.show_palette && matches!(key, "up" | "down" | "enter" | "escape") {
+            let entries = self
+                .shortcuts
+                .search_command_palette_cached(self.preferences.keymap, &self.palette_query);
+            match key {
+                "up" => self.palette_cursor = self.palette_cursor.saturating_sub(1),
+                "down" => {
+                    self.palette_cursor =
+                        (self.palette_cursor + 1).min(entries.len().saturating_sub(1))
+                }
+                "enter" => {
+                    if let Some(entry) = entries.get(self.palette_cursor) {
+                        self.show_palette = false;
+                        self.execute_ui_command(&entry.description, window, cx);
+                    }
+                }
+                _ => {
+                    self.show_palette = false;
+                    self.composer_focus.focus(window, cx);
+                }
+            }
+            self.palette_scroll.scroll_to_item(self.palette_cursor);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.show_shortcuts {
+            self.show_shortcuts = false;
+            self.composer_focus.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.confirm.is_none() && !self.field("worktree-workspace").is_empty()
+        {
+            self.fields.remove("worktree-workspace");
+            self.composer_focus.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.mobile_sidebar {
+            self.mobile_sidebar = false;
+            self.composer_focus.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // Alt+Up/Down reorders the selected session in the sidebar.
+        if event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.shift
+            && matches!(key, "up" | "down")
+        {
+            self.move_selected(if key == "up" { -1 } else { 1 }, cx);
             cx.stop_propagation();
             return;
         }
@@ -1599,6 +3133,7 @@ impl WorkspaceView {
             return;
         }
         if !self.command_popup_visible()
+            || event.keystroke.modifiers.shift
             || !(self.composer_focus.is_focused(window) || self.command_focus.is_focused(window))
         {
             return;
@@ -1652,6 +3187,7 @@ impl WorkspaceView {
                 session_id: session.id.clone(),
                 request_id: uuid::Uuid::new_v4().to_string(),
                 text: "/commands".into(),
+                images: Vec::new(),
             });
             cx.notify();
         }
@@ -1708,7 +3244,7 @@ impl WorkspaceView {
         if self.show_commands {
             let weak = cx.entity().downgrade();
             panel = panel.child(
-                Input::new("command-search")
+                self.scoped_input("command-search")
                     .focus_handle(self.command_focus.clone())
                     .placeholder("Find a Plank control…")
                     .value(self.command_query.clone())
@@ -1788,9 +3324,17 @@ impl WorkspaceView {
         panel.child(rows).into_any_element()
     }
 
+    fn scoped_input(&self, id: impl Into<gpui::ElementId>) -> Input {
+        Input::new(SharedString::from(format!(
+            "{}-{}",
+            self.key_scope,
+            id.into()
+        )))
+    }
+
     fn input(&self, name: &'static str, label: &'static str, cx: &Context<Self>) -> Input {
         let weak = cx.entity().downgrade();
-        Input::new(name)
+        self.scoped_input(name)
             .label(label)
             .value(self.field(name))
             .on_text_change(move |text, _, cx| {
@@ -1865,10 +3409,19 @@ impl WorkspaceView {
                 }
             }
         };
-        self.command(Command::CreateSession {
-            workspace_id,
-            name: self.field("session-name"),
-            backend,
+        let worktree_id = self.field("agent-worktree");
+        self.command(if worktree_id.is_empty() {
+            Command::CreateSession {
+                workspace_id,
+                name: self.field("session-name"),
+                backend,
+            }
+        } else {
+            Command::CreateWorktreeSession {
+                worktree_id,
+                name: self.field("session-name"),
+                backend,
+            }
         });
     }
 
@@ -1876,6 +3429,8 @@ impl WorkspaceView {
         self.preferences.documents = self.documents.clone();
         self.preferences.drafts = self.drafts.clone();
         self.preferences.collapsed = self.collapsed.clone();
+        self.preferences.closed_workspaces = self.closed_workspaces.clone();
+        self.preferences.collapsed_machines = self.collapsed_machines.clone();
         self.preferences.pending_prompts = self.pending_prompts.clone();
         #[cfg(not(target_family = "wasm"))]
         let result = persist_preferences_based(
@@ -1897,10 +3452,9 @@ impl WorkspaceView {
             Ok(())
         })();
         match result {
-            Ok(()) =>
-            {
+            Ok(()) => {
                 #[cfg(not(target_family = "wasm"))]
-                if !self.appearance_only {
+                {
                     self.preferences_base = self.preferences.clone();
                 }
             }
@@ -1956,6 +3510,19 @@ impl WorkspaceView {
 
     fn new_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut panel = layout! { V[g4] { Hd "Add agent" [level="2"] }};
+        if let Some(tree) = self
+            .snapshot
+            .worktrees
+            .iter()
+            .find(|tree| tree.id == self.field("agent-worktree"))
+        {
+            panel = panel.child(div().text_sm().child(format!(
+                "{} / {} · {}",
+                tree.project_name,
+                tree.branch.as_deref().unwrap_or("detached"),
+                tree.directory
+            )));
+        }
         if self.snapshot.workspaces.is_empty() {
             panel =
                 panel.child(layout! { Tx "Create your first workspace to get started." [muted] });
@@ -1992,6 +3559,9 @@ impl WorkspaceView {
                     ButtonVariant::Ghost
                 })
                 .on_click(click(cx, move |view, _, cx| {
+                    if view.workspace.as_ref() != Some(&id) {
+                        view.fields.remove("agent-worktree");
+                    }
                     view.workspace = Some(id.clone());
                     cx.notify();
                 })),
@@ -2082,16 +3652,461 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn worktrees_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let workspace = self.field("worktree-workspace");
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child("Projects & worktrees")
+                    .child(Button::new("close-worktrees", "Close").on_click(click(
+                        cx,
+                        |view, _, cx| {
+                            view.fields.remove("worktree-workspace");
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(self.input(
+                "worktree-discover",
+                "Repository or existing worktree path on daemon",
+                cx,
+            ))
+            .child(
+                Button::new("discover-worktrees", "Discover / attach project").on_click(click(
+                    cx,
+                    |view, _, cx| {
+                        view.command(Command::DiscoverWorktrees {
+                            workspace_id: view.field("worktree-workspace"),
+                            directory: view.field("worktree-discover"),
+                        });
+                        cx.notify();
+                    },
+                )),
+            );
+        if let Some(error) = &self.error {
+            panel = panel.child(div().text_color(cx.theme().error).child(error.clone()));
+        }
+        let mut trees: Vec<_> = self
+            .snapshot
+            .worktrees
+            .iter()
+            .filter(|tree| tree.workspace_id == workspace && !tree.removed)
+            .collect();
+        trees.sort_by_key(|tree| (&tree.project_id, !tree.main, &tree.directory));
+        let mut project = None;
+        for tree in trees {
+            if project != Some(&tree.project_id) {
+                panel = panel.child(
+                    div()
+                        .pt_2()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(tree.project_name.clone()),
+                );
+                project = Some(&tree.project_id);
+            }
+            let source = tree.id.clone();
+            let workspace_id = tree.workspace_id.clone();
+            let agent_tree = tree.id.clone();
+            let remove = tree.id.clone();
+            let inspect = tree.id.clone();
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(format!(
+                    "⑂ {}{}",
+                    tree.branch.as_deref().unwrap_or("detached"),
+                    if tree.main { " · main checkout" } else { "" }
+                )))
+                .child(div().text_xs().child(tree.directory.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("source-{}", tree.id)),
+                                "New worktree from here",
+                            )
+                            .size(ButtonSize::Xs)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.fields.insert("worktree-source".into(), source.clone());
+                                view.fields.insert("worktree-base".into(), "HEAD".into());
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("agent-tree-{}", tree.id)),
+                                "New agent",
+                            )
+                            .size(ButtonSize::Xs)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.fields.remove("worktree-workspace");
+                                view.add_agent(Some(workspace_id.clone()), cx);
+                                view.fields
+                                    .insert("agent-worktree".into(), agent_tree.clone());
+                                cx.notify();
+                            })),
+                        ),
+                );
+            if !tree.main {
+                row = row.child(
+                    Button::new(
+                        SharedString::from(format!("remove-tree-{}", tree.id)),
+                        "Remove checkout…",
+                    )
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(tree.locked)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.confirm = Some(Confirm::RemoveWorktree(remove.clone()));
+                        cx.notify();
+                    })),
+                );
+            }
+            row = row.child(
+                Button::new(
+                    SharedString::from(format!("inspect-tree-{}", tree.id)),
+                    "Inspect changes",
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, _, cx| {
+                    view.inspect_worktree(&inspect);
+                    cx.notify();
+                })),
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            {
+                let tree = tree.clone();
+                row = row.child(
+                    Button::new(
+                        SharedString::from(format!("terminal-tree-{}", tree.id)),
+                        "Open local terminal",
+                    )
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, window, cx| {
+                        view.open_worktree_terminal(tree.clone(), window, cx);
+                    })),
+                );
+            }
+            panel = panel.child(row);
+        }
+        if let Some(source) =
+            self.snapshot.worktrees.iter().find(|tree| {
+                tree.id == self.field("worktree-source") && tree.workspace_id == workspace
+            })
+        {
+            panel = panel
+                .child(
+                    div()
+                        .pt_2()
+                        .child(format!("Create from {}", source.directory)),
+                )
+                .child(self.input("worktree-branch", "New branch name", cx))
+                .child(self.input("worktree-base", "Base branch or commit", cx))
+                .child(self.input(
+                    "worktree-destination",
+                    "Absolute path for the new checkout",
+                    cx,
+                ))
+                .child(
+                    Button::new("create-worktree", "Create worktree")
+                        .variant(ButtonVariant::Primary)
+                        .on_click(click(cx, |view, _, cx| {
+                            view.command(Command::CreateWorktree {
+                                source_id: view.field("worktree-source"),
+                                directory: view.field("worktree-destination"),
+                                branch: view.field("worktree-branch"),
+                                base: view.field("worktree-base"),
+                            });
+                            cx.notify();
+                        })),
+                );
+        }
+        if let Some(WorktreeInspection { id, result, .. }) = &self.worktree_inspection
+            && let Some(tree) = self
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|tree| &tree.id == id && tree.workspace_id == workspace)
+        {
+            let refresh = id.clone();
+            panel = panel
+                .child(div().pt_3().child(format!("Changes · {}", tree.directory)))
+                .child(
+                    Button::new("refresh-worktree-changes", "Refresh changes")
+                        .disabled(result.is_none())
+                        .on_click(click(cx, move |view, _, cx| {
+                            view.inspect_worktree(&refresh);
+                            cx.notify();
+                        })),
+                );
+            panel = match result {
+                None => panel.child("Reading checkout…"),
+                Some(Err(error)) => {
+                    panel.child(div().text_color(cx.theme().error).child(error.clone()))
+                }
+                Some(Ok(changes)) => {
+                    for (label, text) in [
+                        ("Files (?? = untracked)", &changes.status),
+                        ("Staged", &changes.staged),
+                        ("Unstaged", &changes.unstaged),
+                    ] {
+                        panel = panel
+                            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(label))
+                            .child(
+                                div()
+                                    .font_family("Menlo")
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .child(if text.is_empty() {
+                                        "No changes".to_owned()
+                                    } else if text.len() > 128 * 1024 {
+                                        let end = text.floor_char_boundary(128 * 1024);
+                                        format!("{}\n\nPreview limited to 128 KiB; use a terminal to inspect the full diff.", &text[..end])
+                                    } else {
+                                        text.clone()
+                                    }),
+                            );
+                    }
+                    panel
+                }
+            };
+        }
+        panel.into_any_element()
+    }
+
+    fn inspect_worktree(&mut self, id: &str) {
+        let request = uuid::Uuid::new_v4();
+        self.worktree_inspection = Some(WorktreeInspection {
+            id: id.to_owned(),
+            request,
+            result: None,
+        });
+        if self
+            .tx
+            .send(Operation::WorktreeChanges(id.to_owned(), request))
+            .is_err()
+        {
+            self.worktree_inspection = Some(WorktreeInspection {
+                id: id.to_owned(),
+                request,
+                result: Some(Err("Daemon connection is closed".into())),
+            });
+        }
+    }
+
+    fn split_pane(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut preferences = self.preferences.clone();
+        preferences.selected = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|s| !s.archived && Some(&s.id) != self.selected.as_ref())
+            .map(|s| s.id.clone())
+            .or_else(|| self.selected.clone());
+        preferences.navigation = crate::navigation::NavigationMode::Hidden;
+        let parent = cx.entity().downgrade();
+        let client = self.pane_client.clone();
+        let directory = self.pane_directory.clone();
+        let mut snapshot = self.snapshot.clone();
+        snapshot.entries.clear();
+        snapshot.asides.clear();
+        let pane = cx.new(|cx| {
+            let mut pane = Self::with_preferences(client, directory, false, preferences, cx);
+            pane.pane_parent = Some(parent);
+            pane.snapshot = snapshot;
+            pane
+        });
+        pane.read(cx).composer_focus.clone().focus(window, cx);
+        self.pane_splits.push((vertical, pane));
+        cx.notify();
+    }
+
+    fn close_pane(&mut self, cx: &mut Context<Self>) {
+        self.save_preferences();
+        if let Some(parent) = &self.pane_parent {
+            let id = cx.entity_id();
+            let _ = parent.update(cx, |view, cx| {
+                view.pane_splits.retain(|(_, pane)| pane.entity_id() != id);
+                cx.notify();
+            });
+        } else {
+            self.pane_splits.pop();
+            cx.notify();
+        }
+    }
+
+    fn provider_badge(&self, backend: &Backend) -> gpui::AnyElement {
+        match backend {
+            Backend::Local { .. } => div().into_any_element(),
+            Backend::Agent {
+                provider: AgentProvider::Codex,
+                ..
+            } => div()
+                .child(gpui::svg().path("icons/chatgpt.svg").size(px(18.0)))
+                .into_any_element(),
+            Backend::Agent {
+                provider: AgentProvider::MuseCode,
+                ..
+            } => div()
+                .child(gpui::svg().path("icons/muse.svg").size(px(18.0)))
+                .into_any_element(),
+            _ => div()
+                .text_xs()
+                .child(backend_label(backend))
+                .into_any_element(),
+        }
+    }
+
+    fn pane_controls(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("split-right", "◫")
+                    .aria_label("Split right")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, window, cx| {
+                        view.split_pane(true, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("split-down", "⬒")
+                    .aria_label("Split down")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, window, cx| {
+                        view.split_pane(false, window, cx)
+                    })),
+            )
+            .when(
+                self.pane_parent.is_some() || !self.pane_splits.is_empty(),
+                |row| {
+                    row.child(
+                        Button::new("close-pane", "×")
+                            .aria_label("Close pane; keep agent sessions")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, |view, _, cx| view.close_pane(cx))),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn overview_buttons(&self, icons_only: bool, cx: &Context<Self>) -> gpui::AnyElement {
+        let mut buttons = div().flex().items_center().gap_1();
+        for (id, icon, label, selected) in [
+            ("fleet", "▦", "Fleet", self.show_fleet),
+            ("ci", "✓", "CI", self.show_ci),
+            ("monitor", "◈", "Monitor", self.show_monitor),
+            ("docs", "▤", "Docs", self.show_docs),
+        ] {
+            buttons = buttons.child(
+                Button::new(
+                    id,
+                    if icons_only {
+                        icon.to_owned()
+                    } else {
+                        format!("{icon} {label}")
+                    },
+                )
+                .aria_label(label)
+                .selected(selected)
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, _, cx| match id {
+                    "fleet" => view.toggle_fleet(cx),
+                    "ci" => view.toggle_ci(cx),
+                    "monitor" => view.toggle_monitor(cx),
+                    _ => view.toggle_docs(cx),
+                })),
+            );
+        }
+        buttons.into_any_element()
+    }
+
+    fn kill_session_button(&self, session: &Session, surface: &str, cx: &Context<Self>) -> Button {
+        let id = session.id.clone();
+        Button::new(SharedString::from(format!("kill-{surface}-{id}")), "×")
+            .aria_label(format!("Kill session {} (keep transcript)", session.name))
+            .size(ButtonSize::Xs)
+            .variant(ButtonVariant::Ghost)
+            .disabled(session.archived || !self.connected || self.remote_read_only(&id))
+            .on_click(click(cx, move |view, _, cx| {
+                view.command(Command::Stop {
+                    session_id: id.clone(),
+                });
+                cx.notify();
+            }))
+    }
+
     fn sidebar(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut sidebar = div()
             .id("workspace-sidebar")
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2()
             .p_2()
             .h_full()
             .overflow_y_scroll()
-            .bg(colors.surface);
+            .bg(colors.surface)
+            .child(
+                div()
+                    .id("navigator-keyboard-focus")
+                    .key_context("Navigator")
+                    .track_focus(&self.navigation_focus),
+            );
+        sidebar = sidebar.child(
+            Button::new("open-app-palette", "Commands…")
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, |view, window, cx| {
+                    view.execute_ui_command("Command palette", window, cx);
+                })),
+        );
+        sidebar = sidebar.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    Button::new(
+                        "navigation-mode",
+                        format!("Navigation: {}", self.preferences.navigation.label()),
+                    )
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, _, cx| {
+                        view.preferences.navigation = view.preferences.navigation.next();
+                        view.mobile_sidebar = false;
+                        view.save_preferences();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    Button::new("hide-navigation", "‹")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, |view, _, cx| {
+                            view.preferences.navigation = crate::navigation::NavigationMode::Hidden;
+                            view.mobile_sidebar = false;
+                            view.save_preferences();
+                            cx.notify();
+                        })),
+                ),
+        );
         #[cfg(not(target_os = "macos"))]
         {
             sidebar = sidebar.child(
@@ -2109,25 +4124,38 @@ impl WorkspaceView {
                     ),
             );
         }
-        for workspace in &self.snapshot.workspaces {
+        sidebar = sidebar.child(
+            div()
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(colors.muted)
+                .child("WORKSPACES"),
+        );
+        for workspace in self
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| !self.closed_workspaces.contains(&workspace.id))
+        {
             let hue = workspace
                 .id
                 .bytes()
                 .fold(0u32, |hash, b| hash.wrapping_mul(31).wrapping_add(b as u32))
                 % 360;
             let accent = gpui::hsla(hue as f32 / 360.0, 0.65, 0.55, 1.0);
-            let tint = gpui::hsla(hue as f32 / 360.0, 0.65, 0.55, 0.14);
+            let tint = gpui::hsla(hue as f32 / 360.0, 0.65, 0.55, 0.08);
             let collapsed = self.collapsed.contains(&workspace.id);
-            let select_id = workspace.id.clone();
-            let add_id = workspace.id.clone();
             let fold_id = workspace.id.clone();
+            let add_id = workspace.id.clone();
+            let close_id = workspace.id.clone();
             let mut group = div()
                 .rounded(px(7.0))
-                .border_1()
                 .border_l_4()
                 .border_color(accent)
                 .bg(tint)
                 .overflow_hidden();
+            // Consistent group actions: clicking the header hides/shows
+            // the group, `+` adds a session, `✕` closes (with confirm).
             let header = div()
                 .flex()
                 .items_center()
@@ -2139,15 +4167,32 @@ impl WorkspaceView {
                         .id(SharedString::from(format!("workspace-{}", workspace.id)))
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .cursor_pointer()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(workspace.name.clone())
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(colors.muted)
+                                .child(if collapsed { "▸" } else { "▾" }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(workspace.name.clone()),
+                        )
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.workspace = Some(select_id.clone());
+                            if !view.collapsed.remove(&fold_id) {
+                                view.collapsed.insert(fold_id.clone());
+                            }
+                            view.save_preferences();
                             cx.notify();
                         })),
                 )
@@ -2161,26 +4206,89 @@ impl WorkspaceView {
                 )
                 .child(
                     Button::new(
-                        SharedString::from(format!("fold-{}", workspace.id)),
-                        if collapsed { "▸" } else { "▾" },
+                        SharedString::from(format!("close-ws-{}", workspace.id)),
+                        "✕",
                     )
+                    .size(ButtonSize::Xs)
                     .variant(ButtonVariant::Ghost)
                     .on_click(click(cx, move |view, _, cx| {
-                        if !view.collapsed.remove(&fold_id) {
-                            view.collapsed.insert(fold_id.clone());
-                        }
-                        view.save_preferences();
-                        cx.notify();
+                        view.request_close_workspace(close_id.clone(), cx)
                     })),
                 );
             group = group.child(header);
             if !collapsed {
                 let mut sessions = div().flex().flex_col().gap_1().p_1();
-                for session in self.snapshot.sessions.iter().filter(|session| {
-                    session.workspace_id == workspace.id
-                        && (!session.archived || self.show_archived)
-                }) {
+                let workspace_id = workspace.id.clone();
+                let directory = workspace.directory.clone();
+                sessions = sessions.child(
+                    Button::new(
+                        SharedString::from(format!("manage-worktrees-{}", workspace.id)),
+                        "Projects & worktrees…",
+                    )
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.fields
+                            .insert("worktree-workspace".into(), workspace_id.clone());
+                        view.fields
+                            .insert("worktree-discover".into(), directory.clone());
+                        view.mobile_sidebar = false;
+                        cx.notify();
+                    })),
+                );
+                let mut ordered: Vec<_> = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        session.workspace_id == workspace.id
+                            && !self.preferences.closed_tabs.contains(&session.id)
+                            && (!session.archived || self.show_archived)
+                    })
+                    .collect();
+                let tree_for = |session: &Session| {
+                    crate::navigation::session_group_worktree(&self.snapshot, session)
+                };
+                ordered.sort_by_key(|session| {
+                    let tree = tree_for(session);
+                    (
+                        tree.map(|t| t.project_id.as_str()),
+                        tree.map(|t| t.directory.as_str()),
+                        session.position,
+                    )
+                });
+                let mut last_project = None;
+                let mut last_tree = None;
+                for session in ordered {
+                    if let Some(tree) = tree_for(session) {
+                        if last_project != Some(&tree.project_id) {
+                            sessions = sessions.child(
+                                div()
+                                    .pt_2()
+                                    .px_2()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(tree.project_name.clone()),
+                            );
+                            last_project = Some(&tree.project_id);
+                        }
+                        if last_tree != Some(&tree.id) {
+                            sessions = sessions.child(
+                                div()
+                                    .pl_3()
+                                    .text_xs()
+                                    .text_color(colors.muted)
+                                    .child(format!(
+                                        "⑂ {}",
+                                        tree.branch.as_deref().unwrap_or("detached")
+                                    )),
+                            );
+                            last_tree = Some(&tree.id);
+                        }
+                    }
                     let id = session.id.clone();
+                    let menu_id = id.clone();
+                    let drag_id = id.clone();
                     let selected = self.selected.as_ref() == Some(&id);
                     let attention = session.attention
                         || session.recovery_required
@@ -2200,12 +4308,13 @@ impl WorkspaceView {
                         .id(SharedString::from(format!("session-{id}")))
                         .flex()
                         .flex_col()
-                        .gap(px(3.0))
-                        .p_2()
+                        .gap(px(1.0))
+                        .px(px(8.0))
+                        .py(px(5.0))
                         .rounded(px(5.0))
                         .cursor_pointer()
                         .min_w_0()
-                        .border_1()
+                        .border_l_2()
                         .border_color(if attention {
                             accent
                         } else if selected {
@@ -2223,17 +4332,63 @@ impl WorkspaceView {
                             view.show_new = false;
                             view.appearance = false;
                             cx.notify();
-                        }));
-                    if attention {
-                        card = card.shadow(vec![gpui::BoxShadow {
-                            color: gpui::hsla(hue as f32 / 360.0, 0.75, 0.6, 0.45),
-                            offset: gpui::point(px(0.0), px(0.0)),
-                            blur_radius: px(9.0),
-                            spread_radius: px(1.0),
-                            inset: false,
-                        }]);
+                        }))
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                                view.session_menu = Some((menu_id.clone(), event.position));
+                                cx.notify();
+                            }),
+                        );
+                    // Dense two-line row: name + status, then one muted
+                    // detail line (summary, branch, ports). The workspace
+                    // directory repeats per session and is omitted.
+                    let mut detail = if session.summary.is_empty() {
+                        backend_label(&session.backend).to_owned()
+                    } else {
+                        session.summary.clone()
+                    };
+                    if let Some(context) = self.snapshot.contexts.get(&session.id) {
+                        if let Some(branch) = &context.branch {
+                            detail.push_str(&format!(
+                                " · ⑂ {branch}{}",
+                                if context.dirty { "*" } else { "" }
+                            ));
+                        }
+                        if let Some(ports) = &context.ports
+                            && !ports.is_empty()
+                        {
+                            detail.push_str(&format!(
+                                " · :{}",
+                                ports
+                                    .iter()
+                                    .map(u16::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", :")
+                            ));
+                        }
                     }
+                    let drag_value = SessionDrag {
+                        id: drag_id,
+                        label: session.name.clone(),
+                    };
+                    let drop_id = drag_value.id.clone();
+                    let weak = cx.entity().downgrade();
                     card = card
+                        .on_drag(drag_value, |drag, _, _, cx| {
+                            cx.new(|_| SessionDragPreview {
+                                label: drag.label.clone(),
+                            })
+                        })
+                        .drag_over::<SessionDrag>(|style, _, _, _| {
+                            style.bg(gpui::hsla(0.6, 0.4, 0.5, 0.18))
+                        })
+                        .on_drop::<SessionDrag>(move |drag, _window, cx| {
+                            let (dragged, target) = (drag.id.clone(), drop_id.clone());
+                            let _ = weak.update(cx, |view, cx| {
+                                view.reorder_onto(&dragged, &target, cx);
+                            });
+                        })
                         .child(
                             div()
                                 .flex()
@@ -2259,7 +4414,8 @@ impl WorkspaceView {
                                             colors.muted
                                         })
                                         .child(status),
-                                ),
+                                )
+                                .child(self.kill_session_button(session, "workspace", cx)),
                         )
                         .child(
                             div()
@@ -2268,52 +4424,136 @@ impl WorkspaceView {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(if session.summary.is_empty() {
-                                    backend_label(&session.backend).to_owned()
-                                } else {
-                                    session.summary.clone()
-                                }),
+                                .child(detail),
                         );
-                    if let Some(context) = self.snapshot.contexts.get(&session.id) {
-                        if let Some(branch) = &context.branch {
-                            card = card.child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(colors.muted)
-                                    .child(format!(
-                                        "⑂ {branch}{}",
-                                        if context.dirty { "*" } else { "" }
-                                    )),
-                            );
-                        }
-                        if let Some(ports) = &context.ports
-                            && !ports.is_empty()
-                        {
-                            card = card.child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(colors.muted)
-                                    .child(format!(
-                                        "Ports {}",
-                                        ports
-                                            .iter()
-                                            .map(u16::to_string)
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    )),
-                            );
-                        }
-                    }
-                    card = card.child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(colors.muted)
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(workspace.directory.clone()),
-                    );
                     sessions = sessions.child(card);
+                }
+                // Terminals (tools) belonging to this workspace, then the
+                // consistent add row: session, shell, or plank tool.
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                {
+                    for index in 0..self.terminals.len() {
+                        if self.terminal_workspaces.get(index).map(String::as_str)
+                            != Some(workspace.id.as_str())
+                        {
+                            continue;
+                        }
+                        let title = self
+                            .terminal_titles
+                            .get(index)
+                            .map_or_else(|| format!("Terminal {}", index + 1), Clone::clone);
+                        let exited = self.terminals[index].exited();
+                        let label = if exited {
+                            format!("⌁ {title} · exited")
+                        } else {
+                            format!("⌁ {title}")
+                        };
+                        sessions = sessions.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("terminal-{index}")),
+                                        label,
+                                    )
+                                    .variant(if self.active_terminal == Some(index) {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .on_click(click(
+                                        cx,
+                                        move |view, window, cx| {
+                                            view.active_terminal = Some(index);
+                                            view.show_fleet = false;
+                                            view.terminal_focus.focus(window, cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("terminal-close-{index}")),
+                                        "✕",
+                                    )
+                                    .size(ButtonSize::Xs)
+                                    .variant(ButtonVariant::Ghost)
+                                    .on_click(click(cx, move |view, _, cx| {
+                                        view.request_close_terminal(index, cx)
+                                    })),
+                                ),
+                        );
+                    }
+                    let shell_ws = workspace.id.clone();
+                    let plank_ws = workspace.id.clone();
+                    sessions = sessions.child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("term-shell-{}", workspace.id)),
+                                    "+ Shell",
+                                )
+                                .size(ButtonSize::Xs)
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(click(
+                                    cx,
+                                    move |view, window, cx| {
+                                        let shell = std::env::var("SHELL")
+                                            .unwrap_or_else(|_| "/bin/zsh".into());
+                                        view.open_terminal(&shell, "Shell", &shell_ws, window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("term-plank-{}", workspace.id)),
+                                    "+ plank",
+                                )
+                                .size(ButtonSize::Xs)
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(click(
+                                    cx,
+                                    move |view, window, cx| {
+                                        view.open_terminal("plank", "plank", &plank_ws, window, cx);
+                                    },
+                                )),
+                            ),
+                    );
+                    // External tools found on PATH (bacon, mbx, …) launch
+                    // in this workspace's directory like Shell/plank do.
+                    if !self.tool_launchers.is_empty() {
+                        let mut tool_row = div().flex().flex_wrap().gap_1();
+                        for tool in &self.tool_launchers {
+                            let tool_ws = workspace.id.clone();
+                            let program = tool.program;
+                            let args: Vec<&'static str> = tool.args.to_vec();
+                            let name = tool.name;
+                            tool_row = tool_row.child(
+                                Button::new(
+                                    SharedString::from(format!(
+                                        "term-tool-{name}-{}",
+                                        workspace.id
+                                    )),
+                                    format!("+ {name}"),
+                                )
+                                .size(ButtonSize::Xs)
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(click(
+                                    cx,
+                                    move |view, window, cx| {
+                                        view.open_terminal_args(
+                                            program, &args, name, &tool_ws, window, cx,
+                                        );
+                                    },
+                                )),
+                            );
+                        }
+                        sessions = sessions.child(tool_row);
+                    }
                 }
                 group = group.child(sessions);
             }
@@ -2326,7 +4566,1763 @@ impl WorkspaceView {
                     .on_click(click(cx, |view, _, cx| view.add_workspace(cx))),
             );
         }
+        // Closed workspaces stay one click from coming back.
+        for workspace in self
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| self.closed_workspaces.contains(&workspace.id))
+        {
+            let reopen_id = workspace.id.clone();
+            sidebar = sidebar.child(
+                Button::new(
+                    SharedString::from(format!("reopen-{}", workspace.id)),
+                    format!("↩ {} (closed)", workspace.name),
+                )
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, _, cx| {
+                    view.reopen_workspace(&reopen_id, cx)
+                })),
+            );
+        }
+        sidebar = sidebar.child(
+            div()
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(colors.muted)
+                .child("MACHINES"),
+        );
+        // Machines: same consistent actions — header click hides/shows,
+        // rows select the session (reopening its workspace if closed).
+        for machine in crate::machines::machines(&self.snapshot) {
+            let machine_collapsed = self.collapsed_machines.contains(&machine.id);
+            let machine_fold = machine.id.clone();
+            let mut group = div().flex().flex_col().gap_1().p_1();
+            group = group.child(
+                div()
+                    .id(SharedString::from(format!("machine-{}", machine.id)))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.muted)
+                            .child(if machine_collapsed { "▸" } else { "▾" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(machine.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.muted)
+                            .child(machine.session_ids.len().to_string()),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !view.collapsed_machines.remove(&machine_fold) {
+                            view.collapsed_machines.insert(machine_fold.clone());
+                        }
+                        view.save_preferences();
+                        cx.notify();
+                    })),
+            );
+            if !machine_collapsed {
+                for session_id in &machine.session_ids {
+                    let Some(session) = self.snapshot.sessions.iter().find(|s| &s.id == session_id)
+                    else {
+                        continue;
+                    };
+                    let select_id = session.id.clone();
+                    let workspace_name = self
+                        .snapshot
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == session.workspace_id)
+                        .map_or("Workspace", |w| w.name.as_str());
+                    let busy = session.state.busy();
+                    group = group.child(
+                        div()
+                            .id(SharedString::from(format!("machine-session-{select_id}")))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(if self.selected.as_ref() == Some(&select_id) {
+                                colors.background
+                            } else {
+                                colors.surface
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(11.0))
+                                    .child(format!(
+                                        "{} · {}{}",
+                                        session.name,
+                                        workspace_name,
+                                        if busy { " · running" } else { "" }
+                                    )),
+                            )
+                            .child(self.kill_session_button(session, "machine", cx))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.select(select_id.clone());
+                                view.show_new = false;
+                                view.appearance = false;
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            sidebar = sidebar.child(group);
+        }
         sidebar.into_any_element()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn open_worktree_terminal(
+        &mut self,
+        tree: crate::model::Worktree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = window.window_handle();
+        cx.spawn(async move |view, cx| {
+            let checked = tree.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::worktrees::verify(&checked) })
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    if let Err(error) = result {
+                        view.error =
+                            Some(format!("This checkout is not available locally: {error}"));
+                    } else {
+                        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+                            if cfg!(windows) {
+                                "cmd.exe".into()
+                            } else {
+                                "/bin/sh".into()
+                            }
+                        });
+                        view.fields.remove("worktree-workspace");
+                        view.open_terminal_at(
+                            &shell,
+                            &[],
+                            &format!("Shell · {}", tree.branch.as_deref().unwrap_or("detached")),
+                            &tree.workspace_id,
+                            &PathBuf::from(&tree.directory),
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Spawns an embedded terminal tab running `program` (desktop only).
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn open_terminal(
+        &mut self,
+        program: &str,
+        title: &str,
+        workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_terminal_args(program, &[], title, workspace_id, window, cx);
+    }
+
+    /// Spawns an embedded terminal tab running `program` with `args`.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn open_terminal_args(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        title: &str,
+        workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_checkout = self
+            .selected
+            .as_ref()
+            .and_then(|id| {
+                self.snapshot
+                    .sessions
+                    .iter()
+                    .find(|s| &s.id == id && s.workspace_id == workspace_id)
+            })
+            .and_then(|s| s.worktree_id.as_ref())
+            .and_then(|id| self.snapshot.worktrees.iter().find(|tree| &tree.id == id))
+            .map(|tree| PathBuf::from(&tree.directory));
+        let cwd = selected_checkout
+            .or_else(|| {
+                self.snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                    .filter(|workspace| !workspace.directory.is_empty())
+                    .map(|workspace| PathBuf::from(&workspace.directory))
+            })
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| self.directory.clone());
+        self.open_terminal_at(program, args, title, workspace_id, &cwd, window, cx);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[allow(clippy::too_many_arguments)]
+    fn open_terminal_at(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        title: &str,
+        workspace_id: &str,
+        cwd: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::terminal::Terminal::spawn(program, args, cwd, 80, 24) {
+            Ok(terminal) => {
+                self.terminals.push(terminal);
+                self.terminal_titles.push(title.to_owned());
+                self.terminal_workspaces.push(workspace_id.to_owned());
+                self.active_terminal = Some(self.terminals.len() - 1);
+                self.show_fleet = false;
+                self.show_ci = false;
+                self.show_docs = false;
+                self.show_monitor = false;
+                self.terminal_focus.focus(window, cx);
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not start terminal: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Closes a terminal tab and kills its child.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn close_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.terminals.len() {
+            return;
+        }
+        self.terminals[index].kill();
+        self.terminals.remove(index);
+        self.terminal_titles.remove(index);
+        self.terminal_workspaces.remove(index);
+        self.active_terminal = match self.active_terminal {
+            Some(active) if active == index => {
+                if self.terminals.is_empty() {
+                    None
+                } else {
+                    Some(active.min(self.terminals.len() - 1))
+                }
+            }
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+        cx.notify();
+    }
+
+    /// Asks before killing a running terminal; exited ones close at once.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn request_close_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.terminals.get(index).is_some_and(|t| !t.exited()) {
+            self.confirm = Some(Confirm::CloseTerminal(index));
+            cx.notify();
+        } else {
+            self.close_terminal(index, cx);
+        }
+    }
+
+    /// Asks before closing (hiding) a workspace.
+    fn request_close_workspace(&mut self, workspace_id: String, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm::CloseWorkspace(workspace_id));
+        cx.notify();
+    }
+
+    /// Closes a workspace locally: sessions keep running on the daemon and
+    /// stay reachable from the Machines section, which reopens it.
+    fn close_workspace(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
+        self.closed_workspaces.insert(workspace_id.to_owned());
+        if self.workspace.as_deref() == Some(workspace_id) {
+            self.workspace = None;
+        }
+        self.save_preferences();
+        cx.notify();
+    }
+
+    /// Reopens a locally closed workspace.
+    fn reopen_workspace(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
+        if self.closed_workspaces.remove(workspace_id) {
+            self.save_preferences();
+        }
+        cx.notify();
+    }
+
+    /// Runs the action the user just confirmed.
+    fn perform_confirmed(&mut self, cx: &mut Context<Self>) {
+        match self.confirm.take() {
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            Some(Confirm::CloseTerminal(index)) => self.close_terminal(index, cx),
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            Some(Confirm::CloseTerminal(_)) => cx.notify(),
+            Some(Confirm::CloseWorkspace(id)) => self.close_workspace(&id, cx),
+            Some(Confirm::RemoveWorktree(id)) => {
+                self.command(Command::RemoveWorktree { worktree_id: id });
+                cx.notify();
+            }
+            Some(Confirm::DeleteDashboard(name)) => {
+                match crate::dashboards::delete(&self.workspace_directory(), &name) {
+                    Ok(()) => {
+                        self.mon_current = None;
+                        self.reload_dashboards();
+                        self.fetch_monitor(cx);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                cx.notify();
+            }
+            None => cx.notify(),
+        }
+    }
+
+    /// The embedded-terminal panel for the active tab.
+    fn terminal_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let element: gpui::AnyElement;
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            element = self.terminal_panel_desktop(colors, cx);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = colors;
+            let _ = cx;
+            element = div().into_any_element();
+        }
+        element
+    }
+
+    /// The embedded-terminal panel for the active tab (desktop only).
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn terminal_panel_desktop(
+        &self,
+        colors: &WorkspaceTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(index) = self.active_terminal else {
+            return div().into_any_element();
+        };
+        let Some(terminal) = self.terminals.get(index) else {
+            return div().into_any_element();
+        };
+        let (rows, cursor) = terminal.render_rows();
+        let exited = terminal.exited();
+        let title = self
+            .terminal_titles
+            .get(index)
+            .filter(|title| !title.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("Terminal {}", index + 1));
+        let mut body = div()
+            .id("terminal-scroll")
+            .flex()
+            .flex_col()
+            .h_full()
+            .overflow_y_scroll()
+            .bg(gpui::rgb(0x181818))
+            .p_2();
+        for (row_index, row) in rows.iter().enumerate() {
+            let mut line = div()
+                .flex()
+                .flex_row()
+                .h(px(17.0))
+                .font_family("Menlo")
+                .text_size(px(13.0))
+                .whitespace_nowrap();
+            for run in cursor_runs(row, cursor, row_index) {
+                let mut cell = div()
+                    .bg(term_hsla(run.bg))
+                    .text_color(term_hsla(run.fg))
+                    .child(run.text.clone());
+                if run.bold {
+                    cell = cell.font_weight(gpui::FontWeight::BOLD);
+                }
+                if run.italic {
+                    cell = cell.italic();
+                }
+                if run.underline {
+                    cell = cell.underline();
+                }
+                if run.strikeout {
+                    cell = cell.line_through();
+                }
+                line = line.child(cell);
+            }
+            body = body.child(line);
+        }
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                    .child(div().text_color(colors.muted).child(if exited {
+                        "exited"
+                    } else {
+                        "running"
+                    }))
+                    .child(
+                        Button::new("terminal-close", "Close")
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.request_close_terminal(index, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .track_focus(&self.terminal_focus)
+                    .on_key_down(cx.listener(|view, event, _, cx| {
+                        view.terminal_key(event, cx);
+                    }))
+                    .on_scroll_wheel(cx.listener(|view, event: &gpui::ScrollWheelEvent, _, cx| {
+                        if let Some(index) = view.active_terminal
+                            && let Some(terminal) = view.terminals.get(index)
+                        {
+                            let lines = match event.delta {
+                                gpui::ScrollDelta::Lines(point) => point.y,
+                                gpui::ScrollDelta::Pixels(point) => f32::from(point.y) / 17.0,
+                            };
+                            let delta = lines.round() as i32;
+                            if delta != 0 {
+                                terminal.scroll(delta);
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|view, _, window, cx| {
+                            view.terminal_focus.focus(window, cx);
+                        }),
+                    )
+                    .child(body),
+            );
+        if exited {
+            panel = panel.child(
+                div()
+                    .p_2()
+                    .text_color(colors.muted)
+                    .child("Process exited. Close the tab or open a new terminal."),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    /// Forwards one key event to the active terminal (desktop only).
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn terminal_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(index) = self.active_terminal else {
+            return;
+        };
+        let Some(terminal) = self.terminals.get(index) else {
+            return;
+        };
+        let stroke = &event.keystroke;
+        if stroke.modifiers.platform && stroke.key == "v" {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(text) = item.text()
+            {
+                if terminal.bracketed_paste() {
+                    terminal.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
+                } else {
+                    terminal.write(text.as_bytes());
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let input = crate::terminal::KeyInput {
+            key: &stroke.key,
+            text: stroke.key_char.as_deref(),
+            ctrl: stroke.modifiers.control,
+            alt: stroke.modifiers.alt,
+            shift: stroke.modifiers.shift,
+            platform: stroke.modifiers.platform,
+        };
+        if let Some(bytes) = crate::terminal::key_bytes(input, terminal.cursor_keys_application()) {
+            terminal.write(&bytes);
+            cx.notify();
+        }
+    }
+
+    /// Right-click menu for one session (Open, Stop, Archive, Copy ID…).
+    fn session_menu_panel(
+        &self,
+        id: &str,
+        colors: &WorkspaceTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+        else {
+            return div().into_any_element();
+        };
+        let open_id = id.to_owned();
+        let stop_id = id.to_owned();
+        let archive_id = id.to_owned();
+        let copy_id = id.to_owned();
+        let archived = session.archived;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .w(px(210.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(colors.muted)
+            .bg(colors.surface)
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(session.name.clone()),
+            )
+            .child(
+                Button::new("menu-open", "Open")
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.session_menu = None;
+                        view.select(open_id.clone());
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("menu-stop", "Stop")
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(!session.state.busy())
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.session_menu = None;
+                        view.command(Command::Stop {
+                            session_id: stop_id.clone(),
+                        });
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new(
+                    "menu-archive",
+                    if archived { "Unarchive" } else { "Archive" },
+                )
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, move |view, _, cx| {
+                    view.session_menu = None;
+                    view.command(Command::ArchiveSession {
+                        session_id: archive_id.clone(),
+                        archived: !archived,
+                    });
+                    cx.notify();
+                })),
+            )
+            .child(
+                Button::new("menu-copy-id", "Copy Session ID")
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.session_menu = None;
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_id.clone()));
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Preflight data for the selected session's pending prompt.
+    fn current_preflight(&self, session_id: &str) -> Option<crate::preflight::PreflightInfo> {
+        let session = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)?;
+        let draft = self.drafts.get(session_id).cloned().unwrap_or_default();
+        let attachment_bytes = self
+            .attachments
+            .get(session_id)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        Some(crate::preflight::preflight_info(
+            session,
+            self.snapshot.telemetry.get(session_id),
+            &draft,
+            attachment_bytes,
+            backend_label(&session.backend),
+        ))
+    }
+
+    /// Preflight confirmation card shown before risky prompts.
+    fn preflight_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(session_id) = self.selected.clone() else {
+            return div().into_any_element();
+        };
+        let Some(info) = self.current_preflight(&session_id) else {
+            return div().into_any_element();
+        };
+        let mut lines = div().flex().flex_col().gap_1();
+        lines = lines.child(format!("Backend: {}", info.backend));
+        if let Some(percent) = info.ctx_percent {
+            lines = lines.child(format!("Context: {percent}% full"));
+        }
+        lines = lines.child(format!(
+            "Prompt size: ~{} estimated tokens",
+            info.estimated_tokens
+        ));
+        if info.attachment_bytes > 0 {
+            lines = lines.child(format!(
+                "Attachments: {}",
+                format_bytes(info.attachment_bytes)
+            ));
+        }
+        for warning in &info.warnings {
+            lines = lines.child(
+                div()
+                    .text_color(gpui::hsla(0.09, 0.85, 0.55, 1.0))
+                    .child(warning.clone()),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .w(px(430.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(colors.muted)
+            .bg(colors.surface)
+            .child(
+                div()
+                    .text_size(px(17.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Before you run"),
+            )
+            .child(lines)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("preflight-run", "Run anyway")
+                            .variant(ButtonVariant::Primary)
+                            .on_click(click(cx, |view, _, cx| {
+                                view.show_preflight = false;
+                                view.preflight_confirmed = true;
+                                view.submit();
+                                view.preflight_confirmed = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("preflight-cancel", "Cancel")
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, |view, _, cx| {
+                                view.show_preflight = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Fleet overview: every live session as a glanceable card.
+    fn fleet_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cards = crate::fleet::fleet_cards(&self.snapshot);
+        let attention_count = cards.iter().filter(|card| card.attention.is_some()).count();
+        let header = format!(
+            "Fleet · {} sessions · {} need attention",
+            cards.len(),
+            attention_count
+        );
+        let mut panel = div()
+            .id("fleet-scroll")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .h_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(header),
+            );
+        if cards.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_color(colors.muted)
+                    .child("No live sessions yet. Create a workspace, then add a session."),
+            );
+        }
+        let mut grid = div().flex().flex_row().flex_wrap().gap_3();
+        for card in cards {
+            let id = card.id.clone();
+            let workspace_name = self
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == card.workspace_id)
+                .map_or("Workspace", |workspace| workspace.name.as_str())
+                .to_owned();
+            let attention_label = card.attention.map(|reason| match reason {
+                crate::fleet::AttentionReason::Approval => "Needs approval",
+                crate::fleet::AttentionReason::Recovery => "Needs recovery",
+                crate::fleet::AttentionReason::Failed => "Failed",
+                crate::fleet::AttentionReason::Disconnected => "Disconnected",
+                crate::fleet::AttentionReason::Attention => "Needs attention",
+            });
+            let mut element = div()
+                .id(SharedString::from(format!("fleet-{id}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p_2()
+                .w(px(248.0))
+                .h(px(132.0))
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(if card.attention.is_some() {
+                    gpui::hsla(0.02, 0.75, 0.55, 0.9)
+                } else if card.busy {
+                    gpui::hsla(0.36, 0.55, 0.45, 0.7)
+                } else {
+                    colors.muted.into()
+                })
+                .bg(colors.surface)
+                .cursor_pointer()
+                .overflow_hidden()
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.select(id.clone());
+                    view.show_fleet = false;
+                    view.show_new = false;
+                    view.appearance = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(card.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.muted)
+                        .child(workspace_name),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .child(if let Some(label) = attention_label {
+                            label.to_owned()
+                        } else {
+                            card.state_label.to_owned()
+                        }),
+                );
+            // Telemetry status often repeats the state label verbatim
+            // ("Ready" / "Ready"); only show it when it adds information.
+            let headline = attention_label.unwrap_or(card.state_label);
+            if card.status_line != headline {
+                element = element.child(
+                    div()
+                        .text_size(px(12.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(card.status_line.clone()),
+                );
+            }
+            // Context bar and elapsed share one row so the fixed card
+            // height never clips the last line.
+            if card.ctx_percent.is_some() || card.elapsed_secs.is_some() {
+                let mut meta = div().flex().items_center().gap_2();
+                if let Some(percent) = card.ctx_percent {
+                    meta = meta
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .h(px(6.0))
+                                .rounded(px(3.0))
+                                .bg(gpui::hsla(0.0, 0.0, 0.5, 0.25))
+                                .child(
+                                    div()
+                                        .w(px(f32::from(percent) * 1.2))
+                                        .h(px(6.0))
+                                        .rounded(px(3.0))
+                                        .bg(gpui::hsla(0.36, 0.6, 0.45, 1.0)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(colors.muted)
+                                .child(format!("ctx {percent}%")),
+                        );
+                }
+                if let Some(elapsed) = card.elapsed_secs {
+                    meta = meta.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(colors.muted)
+                            .child(format!("{} elapsed", crate::fleet::format_elapsed(elapsed))),
+                    );
+                }
+                element = element.child(meta);
+            }
+            // Live miniature of the session window: tiny summary/status
+            // lines, refreshed every snapshot poll.
+            let mini_text = if card.summary.is_empty() {
+                card.status_line.clone()
+            } else {
+                card.summary.clone()
+            };
+            element = element.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .rounded(px(4.0))
+                    .bg(colors.background)
+                    .p_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(colors.muted)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("● ● ●  {}", card.name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(mini_text),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(colors.muted)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(card.status_line.clone()),
+                    ),
+            );
+            grid = grid.child(element);
+        }
+        panel = panel.child(grid);
+        // Live miniatures of the real terminal windows: the actual grid
+        // text at miniature size, re-rendered on every poll tick.
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if !self.terminals.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Terminals"),
+            );
+            let mut term_grid = div().flex().flex_row().flex_wrap().gap_3();
+            for (index, terminal) in self.terminals.iter().enumerate() {
+                let title = self
+                    .terminal_titles
+                    .get(index)
+                    .map_or_else(|| format!("Terminal {}", index + 1), Clone::clone);
+                let (rows, _) = terminal.render_rows();
+                let mut lines: Vec<String> = rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|run| run.text.as_str())
+                            .collect::<String>()
+                            .trim_end()
+                            .to_owned()
+                    })
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                lines = lines.split_off(lines.len().saturating_sub(6));
+                let mut mini = div()
+                    .id(SharedString::from(format!("fleet-term-{index}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .p_2()
+                    .w(px(248.0))
+                    .h(px(132.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(colors.muted)
+                    .bg(gpui::hsla(0.0, 0.0, 0.08, 1.0))
+                    .cursor_pointer()
+                    .overflow_hidden()
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.active_terminal = Some(index);
+                        view.show_fleet = false;
+                        view.terminal_focus.focus(window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(gpui::hsla(0.0, 0.0, 0.75, 1.0))
+                            .child(format!(
+                                "● ● ●  {title}{}",
+                                if terminal.exited() { " · exited" } else { "" }
+                            )),
+                    );
+                for line in lines {
+                    mini = mini.child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(gpui::hsla(0.0, 0.0, 0.85, 1.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(line),
+                    );
+                }
+                term_grid = term_grid.child(mini);
+            }
+            panel = panel.child(term_grid);
+        }
+        panel.into_any_element()
+    }
+
+    /// CI runs board for the current workspace repository.
+    fn ci_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |age| age.as_secs() as i64);
+        let mut panel = div()
+            .id("ci-scroll")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .h_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format!(
+                                "CI · {}",
+                                self.workspace_directory().file_name().map_or_else(
+                                    || "workspace".into(),
+                                    |n| n.to_string_lossy().into_owned()
+                                )
+                            )),
+                    )
+                    .child(
+                        Button::new(
+                            "ci-refresh",
+                            if self.ci_loading {
+                                "…"
+                            } else {
+                                "↻ Refresh"
+                            },
+                        )
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .disabled(self.ci_loading)
+                        .on_click(click(cx, |view, _, cx| view.refresh_ci(cx))),
+                    ),
+            );
+        match &self.ci_result {
+            None => {
+                panel = panel.child(div().text_color(colors.muted).child(if self.ci_loading {
+                    "Fetching runs…"
+                } else {
+                    "No CI data yet."
+                }));
+            }
+            Some(Err(error)) => {
+                panel = panel.child(
+                    div()
+                        .text_color(colors.muted)
+                        .child(format!("Could not load CI runs: {error}")),
+                );
+            }
+            Some(Ok((provider, runs))) => {
+                panel = panel.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.muted)
+                        .child(format!("{} · {} runs", provider.label(), runs.len())),
+                );
+                if runs.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .text_color(colors.muted)
+                            .child("No workflow runs found for this repository."),
+                    );
+                }
+                for (index, run) in runs.iter().enumerate() {
+                    let url = run.url.clone();
+                    let color = match run.state {
+                        crate::ci::CiState::Success => gpui::hsla(0.36, 0.55, 0.45, 1.0),
+                        crate::ci::CiState::Failure => gpui::hsla(0.02, 0.75, 0.55, 1.0),
+                        crate::ci::CiState::Running => gpui::hsla(0.13, 0.8, 0.55, 1.0),
+                        _ => colors.muted.into(),
+                    };
+                    let mut meta = format!("{} · {}", run.branch, run.event);
+                    if let Some(duration) = &run.duration {
+                        meta.push_str(&format!(" · {duration}"));
+                    }
+                    let age = crate::ci::relative_age(&run.started, now);
+                    if !age.is_empty() {
+                        meta.push_str(&format!(" · {age}"));
+                    }
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("ci-run-{index}")))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .bg(colors.surface)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_view, _, _, cx| {
+                                if !url.is_empty() {
+                                    cx.open_url(&url);
+                                }
+                            }))
+                            .child(div().text_color(color).child(run.state.glyph()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(run.workflow.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.muted)
+                                    .child(meta),
+                            ),
+                    );
+                }
+            }
+        }
+        panel.into_any_element()
+    }
+
+    /// Read-only Markdown viewer: file list + rendered document.
+    fn docs_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let root = self.workspace_directory();
+        let mut list = div().flex().flex_col().gap_1().w(px(220.0)).flex_shrink_0();
+        list = list.child(
+            Button::new("docs-refresh", "↻ Rescan")
+                .size(ButtonSize::Xs)
+                .variant(ButtonVariant::Ghost)
+                .on_click(click(cx, |view, _, cx| {
+                    view.rescan_markdown();
+                    if let Some(current) = view.markdown_current.clone() {
+                        view.open_markdown(current);
+                    }
+                    cx.notify();
+                })),
+        );
+        if self.markdown_files.is_empty() {
+            list = list.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(colors.muted)
+                    .child("No .md files in this workspace."),
+            );
+        }
+        for path in &self.markdown_files {
+            let open_path = path.clone();
+            let label = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            list = list.child(
+                Button::new(
+                    SharedString::from(format!("docs-file-{}", path.display())),
+                    label,
+                )
+                .size(ButtonSize::Xs)
+                .variant(if self.markdown_current.as_ref() == Some(path) {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_click(click(cx, move |view, _, cx| {
+                    view.open_markdown(open_path.clone());
+                    cx.notify();
+                })),
+            );
+        }
+        let body: gpui::AnyElement = match &self.markdown_content {
+            Some(Ok(text)) => div()
+                .id("docs-scroll")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_y_scroll()
+                .p_3()
+                .child(Markdown::new("docs-current", text.clone()))
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .flex_1()
+                .p_3()
+                .text_color(colors.muted)
+                .child(error.clone())
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .p_3()
+                .text_color(colors.muted)
+                .child("Pick a file to read.")
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .gap_3()
+            .p_3()
+            .h_full()
+            .child(list)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// Monitoring dashboards for the current workspace.
+    fn monitor_panel(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut panel = div()
+            .id("monitor-scroll")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .h_full()
+            .overflow_y_scroll();
+        // Header: title, ranges, refresh.
+        let mut header = div().flex().items_center().gap_2().child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("Monitoring"),
+        );
+        for (label, secs) in [("15m", 900), ("1h", 3_600), ("6h", 21_600), ("24h", 86_400)] {
+            header = header.child(
+                Button::new(SharedString::from(format!("mon-range-{secs}")), label)
+                    .size(ButtonSize::Xs)
+                    .variant(if self.mon_range_secs == secs {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.mon_range_secs = secs;
+                        view.fetch_monitor(cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        header = header.child(
+            Button::new(
+                "mon-refresh",
+                if self.mon_loading {
+                    "…"
+                } else {
+                    "↻ Refresh"
+                },
+            )
+            .size(ButtonSize::Xs)
+            .variant(ButtonVariant::Ghost)
+            .disabled(self.mon_loading)
+            .on_click(click(cx, |view, _, cx| view.fetch_monitor(cx))),
+        );
+        if self.mon_last_fetch.is_some() {
+            header = header.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.muted)
+                    .child("auto-refresh 30s"),
+            );
+        }
+        panel = panel.child(header);
+        // Source row: global Prometheus URL (Preferences) + Apply.
+        panel = panel.child(
+            div()
+                .flex()
+                .items_end()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(340.0))
+                        .child(self.input("mon-prom-url", "Prometheus URL", cx)),
+                )
+                .child(
+                    Button::new("mon-apply-url", "Apply")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, |view, _, cx| view.mon_apply_url(cx))),
+                )
+                .child(div().text_size(px(11.0)).text_color(colors.muted).child(
+                    match &self.mon_metrics {
+                        None => "metrics: not loaded".to_owned(),
+                        Some(Ok(names)) => format!("metrics: {} available", names.len()),
+                        Some(Err(error)) => format!("metrics unavailable: {error}"),
+                    },
+                )),
+        );
+        // Dashboard tabs + creation.
+        let mut tabs = div().flex().flex_wrap().items_end().gap_1();
+        for dashboard in &self.mon_dashboards {
+            let name = dashboard.name.clone();
+            let select = name.clone();
+            tabs = tabs.child(
+                Button::new(SharedString::from(format!("mon-dash-{name}")), name)
+                    .size(ButtonSize::Xs)
+                    .variant(if self.mon_current.as_deref() == Some(select.as_str()) {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.mon_current = Some(select.clone());
+                        view.mon_data.clear();
+                        view.fetch_monitor(cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        tabs = tabs
+            .child(
+                div()
+                    .w(px(180.0))
+                    .child(self.input("mon-dash-name", "New dashboard", cx)),
+            )
+            .child(
+                Button::new("mon-dash-create", "+ Dashboard")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, |view, _, cx| view.mon_create_dashboard(cx))),
+            );
+        if let Some(current) = self.mon_current.clone() {
+            tabs = tabs.child(
+                Button::new("mon-dash-delete", "Delete")
+                    .size(ButtonSize::Xs)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(click(cx, move |view, _, cx| {
+                        view.confirm = Some(Confirm::DeleteDashboard(current.clone()));
+                        cx.notify();
+                    })),
+            );
+        }
+        panel = panel.child(tabs);
+        if let Some(error) = &self.mon_error {
+            panel = panel.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(gpui::hsla(0.02, 0.75, 0.6, 1.0))
+                    .child(error.clone()),
+            );
+        }
+        // Panel editor (new or existing), with the metric browser.
+        if self.mon_edit.is_some() {
+            panel = panel.child(self.mon_editor(colors, cx));
+        }
+        // Panels grid.
+        match self.current_dashboard() {
+            None => {
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(colors.muted)
+                                .child("No dashboards yet for this workspace."),
+                        )
+                        .child(
+                            Button::new("mon-starter", "Create starter dashboard")
+                                .size(ButtonSize::Xs)
+                                .variant(ButtonVariant::Primary)
+                                .on_click(click(cx, |view, _, cx| {
+                                    let starter = crate::dashboards::Dashboard::starter();
+                                    match crate::dashboards::save(
+                                        &view.workspace_directory(),
+                                        &starter,
+                                    ) {
+                                        Ok(_) => {
+                                            view.mon_current = Some(starter.name.clone());
+                                            view.reload_dashboards();
+                                            view.fetch_monitor(cx);
+                                        }
+                                        Err(error) => view.mon_error = Some(error),
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            Some(dashboard) => {
+                let mut grid = div().flex().flex_row().flex_wrap().gap_3();
+                for (index, mon_panel) in dashboard.panels.iter().enumerate() {
+                    grid = grid.child(self.mon_panel_card(index, mon_panel, colors, cx));
+                }
+                grid = grid.child(
+                    Button::new("mon-panel-add", "+ Panel")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, |view, _, cx| {
+                            view.mon_open_panel_editor(MonEdit::New, None);
+                            cx.notify();
+                        })),
+                );
+                if dashboard.panels.is_empty() && self.mon_edit.is_none() {
+                    panel = panel.child(div().text_color(colors.muted).child(
+                        "This dashboard has no panels yet. Add one, or pick a metric below.",
+                    ));
+                }
+                panel = panel.child(grid);
+            }
+        }
+        // Metric browser: click a metric to start a panel from it.
+        panel = panel.child(self.mon_metric_browser(colors, cx));
+        panel.into_any_element()
+    }
+
+    /// Panel editor form: title, kind cycle, PromQL, unit, save/cancel.
+    fn mon_editor(&self, colors: &WorkspaceTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let kind_label = self.field("mon-panel-kind");
+        let mut editor = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(gpui::hsla(0.0, 0.0, 0.5, 0.35))
+            .bg(colors.surface)
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(match self.mon_edit {
+                        Some(MonEdit::Existing(_)) => "Edit panel",
+                        _ => "New panel",
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(220.0))
+                            .child(self.input("mon-panel-title", "Title", cx)),
+                    )
+                    .child(
+                        Button::new("mon-panel-kind", format!("Kind: {kind_label}"))
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, |view, _, cx| {
+                                let current = crate::dashboards::PanelKind::ALL
+                                    .iter()
+                                    .find(|kind| kind.label() == view.field("mon-panel-kind"))
+                                    .copied()
+                                    .unwrap_or(crate::dashboards::PanelKind::Line);
+                                view.fields
+                                    .insert("mon-panel-kind".into(), current.next().label().into());
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(90.0))
+                            .child(self.input("mon-panel-unit", "Unit", cx)),
+                    ),
+            )
+            .child(self.input("mon-panel-query", "PromQL", cx));
+        if !self.mon_label_keys.is_empty() {
+            editor = editor.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.muted)
+                    .child(format!("Labels: {}", self.mon_label_keys.join(", "))),
+            );
+        }
+        editor = editor.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("mon-panel-save", "Save panel")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Primary)
+                        .on_click(click(cx, |view, _, cx| view.mon_save_panel(cx))),
+                )
+                .child(
+                    Button::new("mon-panel-cancel", "Cancel")
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, |view, _, cx| {
+                            view.mon_edit = None;
+                            cx.notify();
+                        })),
+                ),
+        );
+        editor.into_any_element()
+    }
+
+    /// Searchable metric list; clicking a metric starts/edits a panel.
+    fn mon_metric_browser(
+        &self,
+        colors: &WorkspaceTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut browser = div().flex().flex_col().gap_1().child(
+            div()
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("Metrics"),
+        );
+        browser = browser.child(self.input("mon-metric-search", "Search metrics", cx));
+        match &self.mon_metrics {
+            None => {
+                browser = browser.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.muted)
+                        .child("Loading metric names…"),
+                );
+            }
+            Some(Err(error)) => {
+                browser = browser.child(div().text_size(px(12.0)).text_color(colors.muted).child(
+                    format!(
+                        "Could not list metrics from {}: {error}",
+                        self.prometheus_url()
+                    ),
+                ));
+            }
+            Some(Ok(names)) => {
+                let filter = self.field("mon-metric-search").to_ascii_lowercase();
+                let mut list = div().flex().flex_wrap().gap_1();
+                let mut shown = 0usize;
+                for name in names {
+                    if shown >= 40 {
+                        break;
+                    }
+                    if !filter.is_empty() && !name.to_ascii_lowercase().contains(&filter) {
+                        continue;
+                    }
+                    shown += 1;
+                    let metric = name.clone();
+                    list = list.child(
+                        Button::new(
+                            SharedString::from(format!("mon-metric-{name}")),
+                            name.clone(),
+                        )
+                        .size(ButtonSize::Xs)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(click(cx, move |view, _, cx| {
+                            if view.mon_edit.is_some() {
+                                view.fields.insert("mon-panel-query".into(), metric.clone());
+                            } else {
+                                view.mon_open_panel_editor(MonEdit::New, Some(metric.clone()));
+                            }
+                            view.fetch_metric_labels(metric.clone(), cx);
+                            cx.notify();
+                        })),
+                    );
+                }
+                if shown == 0 {
+                    list = list.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(colors.muted)
+                            .child("No metrics match the search."),
+                    );
+                }
+                browser = browser.child(list);
+            }
+        }
+        browser.into_any_element()
+    }
+
+    /// One panel card: title bar plus the chart for its kind.
+    fn mon_panel_card(
+        &self,
+        index: usize,
+        mon_panel: &crate::dashboards::Panel,
+        colors: &WorkspaceTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .w(px(430.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(gpui::hsla(0.0, 0.0, 0.5, 0.35))
+            .bg(colors.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(mon_panel.title.clone()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("mon-panel-edit-{index}")), "✎")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.mon_open_panel_editor(MonEdit::Existing(index), None);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("mon-panel-del-{index}")), "✕")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.mon_delete_panel(index, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.muted)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(mon_panel.query.clone()),
+            );
+        card = card.child(match self.mon_data.get(&index) {
+            None => div()
+                .text_size(px(12.0))
+                .text_color(colors.muted)
+                .child(if self.mon_loading {
+                    "Loading…"
+                } else {
+                    "No data yet — Refresh"
+                })
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .text_size(px(12.0))
+                .text_color(colors.muted)
+                .child(format!("Query failed: {error}"))
+                .into_any_element(),
+            Some(Ok(series)) if series.is_empty() => div()
+                .text_size(px(12.0))
+                .text_color(colors.muted)
+                .child("No series in range")
+                .into_any_element(),
+            Some(Ok(series)) => self.mon_chart(mon_panel, series, colors),
+        });
+        card.into_any_element()
+    }
+
+    /// Chart body for one panel, drawn with d3rs scales/curves/colors.
+    fn mon_chart(
+        &self,
+        mon_panel: &crate::dashboards::Panel,
+        series: &[crate::prom::Series],
+        colors: &WorkspaceTheme,
+    ) -> gpui::AnyElement {
+        match mon_panel.kind {
+            crate::dashboards::PanelKind::Stat => {
+                let mut body = div().flex().flex_wrap().gap_3();
+                for (index, one) in series.iter().enumerate() {
+                    let latest = one.latest().unwrap_or(0.0);
+                    let delta = match (one.points.first(), one.points.last()) {
+                        (Some((_, first)), Some((_, last))) if *first != 0.0 => {
+                            format!(" ({:+.1}%)", (last - first) / first * 100.0)
+                        }
+                        _ => String::new(),
+                    };
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(22.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(mon_series_color(index))
+                                    .child(format!(
+                                        "{}{}",
+                                        crate::prom::format_value(latest),
+                                        mon_panel.unit
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted)
+                                    .child(format!("{}{delta}", one.legend())),
+                            ),
+                    );
+                }
+                body.into_any_element()
+            }
+            crate::dashboards::PanelKind::Bar => {
+                let max = series
+                    .iter()
+                    .filter_map(crate::prom::Series::latest)
+                    .fold(1.0_f64, f64::max);
+                let mut body = div().flex().flex_col().gap_1();
+                for (index, one) in series.iter().take(10).enumerate() {
+                    let value = one.latest().unwrap_or(0.0);
+                    body = body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(130.0))
+                                    .flex_shrink_0()
+                                    .text_size(px(10.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(one.legend()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(10.0))
+                                    .rounded(px(3.0))
+                                    .bg(gpui::hsla(0.0, 0.0, 0.5, 0.2))
+                                    .child(
+                                        div()
+                                            .h(px(10.0))
+                                            // Fraction of the track, not a fixed
+                                            // width: a 360px bar overflowed the
+                                            // card on narrow panels.
+                                            .w(gpui::relative((value / max).clamp(0.0, 1.0) as f32))
+                                            .rounded(px(3.0))
+                                            .bg(mon_series_color(index)),
+                                    ),
+                            )
+                            .child(div().text_size(px(11.0)).child(format!(
+                                "{}{}",
+                                crate::prom::format_value(value),
+                                mon_panel.unit
+                            ))),
+                    );
+                }
+                body.into_any_element()
+            }
+            crate::dashboards::PanelKind::Line | crate::dashboards::PanelKind::Area => {
+                let filled = mon_panel.kind == crate::dashboards::PanelKind::Area;
+                let chart = mon_line_canvas(series.to_vec(), filled);
+                let mut body = div().flex().flex_col().gap_1().child(chart);
+                // Axis extremes and legend keep the canvas readable.
+                let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
+                for one in series {
+                    for (_, value) in &one.points {
+                        ymin = ymin.min(*value);
+                        ymax = ymax.max(*value);
+                    }
+                }
+                let mut legend = div().flex().flex_wrap().gap_2().child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.muted)
+                        .child(format!(
+                            "{} … {}",
+                            crate::prom::format_value(ymin),
+                            crate::prom::format_value(ymax)
+                        )),
+                );
+                for (index, one) in series.iter().take(6).enumerate() {
+                    legend = legend.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(mon_series_color(index))
+                            .child(format!("■ {}", one.legend())),
+                    );
+                }
+                body = body.child(legend);
+                body.into_any_element()
+            }
+        }
     }
 
     fn conversation(
@@ -2349,13 +6345,21 @@ impl WorkspaceView {
         let entries = crate::transcript::messages(&self.snapshot.entries[start..]);
         let mut transcript = div()
             .id("transcript")
+            .key_context("Transcript")
+            .track_focus(&self.transcript_focus)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_2();
+            .gap_1()
+            .px_3()
+            .py_2();
+        if !self.snapshot.entries.is_empty()
+            && let Some(scroll) = self.transcript_scroll.get(&session.id)
+        {
+            transcript = transcript.track_scroll(scroll);
+        }
         if entries.is_empty() {
             transcript = transcript.child(layout! { V[g4] { Hd "A place to think and build" [level="2"], Tx "Send a prompt to begin. Runs belong to the daemon and survive window closure." [muted] }});
         }
@@ -2410,6 +6414,7 @@ impl WorkspaceView {
             role,
             text,
             boundary,
+            kind,
         } in entries
         {
             if boundary {
@@ -2428,7 +6433,10 @@ impl WorkspaceView {
                 );
                 continue;
             }
-            let folded = matches!(
+            let folded = !matches!(
+                kind,
+                Some(crate::model::EntryKind::ToolResult { ok: false })
+            ) && matches!(
                 role,
                 "tool"
                     | "thinking"
@@ -2460,32 +6468,78 @@ impl WorkspaceView {
                     continue;
                 }
             }
-            transcript = transcript.child(
-                div()
-                    .p_2()
-                    .rounded(px(cx.design().corners.md))
-                    .bg(colors.surface)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.muted)
-                            .child(role.replace('_', " ").to_uppercase()),
-                    )
-                    .child(Markdown::new(
+            let header = match &kind {
+                Some(crate::model::EntryKind::ToolCall { name, target }) => {
+                    let name = if name.is_empty() {
+                        "tool"
+                    } else {
+                        name.as_str()
+                    };
+                    if target.is_empty() {
+                        format!("Tool · {name}")
+                    } else {
+                        format!("Tool · {name} · {target}")
+                    }
+                }
+                Some(crate::model::EntryKind::ToolResult { ok }) => {
+                    if *ok {
+                        "Tool result".to_owned()
+                    } else {
+                        "Tool failed".to_owned()
+                    }
+                }
+                Some(crate::model::EntryKind::Diff { path }) => format!("Diff · {path}"),
+                Some(crate::model::EntryKind::Artifact { name, .. }) => {
+                    format!("Artifact · {name}")
+                }
+                None => role.replace('_', " ").to_uppercase(),
+            };
+            let body: gpui::AnyElement =
+                if matches!(kind, Some(crate::model::EntryKind::Diff { .. })) {
+                    diff_lines(&text)
+                } else {
+                    Markdown::new(
                         SharedString::from(format!("entry-{sequence}")),
                         text.into_owned(),
-                    )),
+                    )
+                    .into_any_element()
+                };
+            transcript = transcript.child(
+                div()
+                    .px_2()
+                    .py(px(10.0))
+                    .w_full()
+                    .max_w(px(1000.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(colors.muted)
+                            .child(header),
+                    )
+                    .child(body),
             );
         }
         let id = session.id.clone();
         let weak = cx.entity().downgrade();
         let draft_id = id.clone();
         let offer = self.offered_suggestion(session).cloned();
-        let prompt_input = layout! { I #prompt [placeholder="Message your agent…"] }
+        let prompt_input = self
+            .scoped_input(SharedString::from(format!(
+                "prompt-{}-{}",
+                self.key_scope, session.id
+            )))
+            .multiline(true)
+            .icon_right("↵")
+            .aria_label(
+                "Message your agent. Enter sends; Shift-Enter adds a line; slash opens commands.",
+            )
             .placeholder(if offer.is_some() {
                 ""
             } else {
-                "Message your agent…"
+                "Message your agent… / for commands"
             })
             .focus_handle(self.composer_focus.clone())
             .value(self.drafts.get(&id).cloned().unwrap_or_default())
@@ -2532,6 +6586,20 @@ impl WorkspaceView {
                 }
             });
         let mut prompt = div().relative().child(prompt_input);
+        // Cmd+V with an image on the clipboard attaches it instead of
+        // pasting nothing (the Input stops propagation for text paste
+        // first, so Cmd+Shift+V via PasteImage is the reliable path).
+        prompt = prompt.on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.platform
+                && event.keystroke.key == "v"
+                && view.composer_focus.is_focused(window)
+                && view.paste_clipboard_image(cx)
+            {
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }));
         if let Some(offer) = offer {
             let tab_id = id.clone();
             let tab_revision = offer.revision.clone();
@@ -2576,50 +6644,106 @@ impl WorkspaceView {
         }
         let stop_id = id.clone();
         let reset_id = id.clone();
-        let mut composer = layout! { V[g2] {} }.child(prompt).child(
-            layout! { H[g2] {} }
-                .child(
-                    Button::new("plank-commands", "/")
-                        .size(ButtonSize::Xs)
-                        .variant(ButtonVariant::Ghost)
-                        .disabled(!matches!(
-                            session.backend,
-                            Backend::Local { .. } | Backend::Remote { .. }
-                        ))
-                        .on_click(click(cx, |view, _, cx| view.open_commands(cx))),
-                )
-                .child(
-                    layout! { B.primary("Send") #send }
-                        .size(ButtonSize::Xs)
-                        .disabled(!self.can_submit(session))
-                        .on_click(click(cx, |view, _, cx| {
-                            view.submit();
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    layout! { B.destructive("Stop") #stop }
-                        .size(ButtonSize::Xs)
-                        .disabled(!session.state.busy())
-                        .on_click(click(cx, move |view, _, cx| {
-                            view.command(Command::Stop {
-                                session_id: stop_id.clone(),
-                            });
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    layout! { B.ghost("Fresh context") #reset }
-                        .size(ButtonSize::Xs)
-                        .disabled(session.state.busy())
-                        .on_click(click(cx, move |view, _, cx| {
-                            view.command(Command::Reset {
-                                session_id: reset_id.clone(),
-                            });
-                            cx.notify();
-                        })),
-                ),
-        );
+        let mut composer = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("reset", "↺")
+                            .aria_label("Start fresh context")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(session.state.busy() || session.archived)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.command(Command::Reset {
+                                    session_id: reset_id.clone(),
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("stop", "×")
+                            .aria_label("Stop agent")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(!session.state.busy() || self.remote_read_only(&id))
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.command(Command::Stop {
+                                    session_id: stop_id.clone(),
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("attach-files", "📎")
+                            .aria_label("Attach files")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(session.archived)
+                            .on_click(click(cx, |view, _, cx| view.attach_via_picker(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("composer-scroll")
+                    .max_h(px(240.0))
+                    .overflow_y_scroll()
+                    .child(prompt),
+            );
+        if let Some(files) = self.attachments.get(&id).filter(|files| !files.is_empty()) {
+            let mut chips = div().flex().flex_row().flex_wrap().gap_1();
+            for path in files {
+                let remove_path = path.clone();
+                let remove_session = id.clone();
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+                let mut chip = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(colors.muted)
+                    .bg(colors.surface)
+                    .px_2()
+                    .py_1()
+                    .text_size(px(12.0));
+                if is_image_path(path) {
+                    chip = chip.child(
+                        gpui::img(path.clone())
+                            .size(px(24.0))
+                            .rounded(px(3.0))
+                            .object_fit(gpui::ObjectFit::Cover),
+                    );
+                }
+                chips = chips.child(
+                    chip.child(format!("{label} · {}", format_bytes(size)))
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("detach-{}", path.display())),
+                                "×",
+                            )
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, move |view, _, cx| {
+                                if let Some(list) = view.attachments.get_mut(&remove_session) {
+                                    list.retain(|item| item != &remove_path);
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                );
+            }
+            composer = composer.child(chips);
+        }
         if session.progress.is_some() {
             composer = composer.child(
                 div()
@@ -2651,98 +6775,133 @@ impl WorkspaceView {
                 ));
             }
         }
+        let mut questions = div()
+            .id("pending-questions")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(px(300.0))
+            .overflow_y_scroll()
+            .flex_shrink_0();
+        let first_question = session
+            .approvals
+            .iter()
+            .find(|approval| approval.requirement["kind"] != "plank_editor")
+            .map(|approval| &approval.id);
         for approval in &session.approvals {
             if approval.requirement["kind"] == "plank_editor" {
-                composer = composer.child(self.document_editor(&session.id, approval, cx));
+                questions = questions.child(self.document_editor(&session.id, approval, cx));
                 continue;
             }
             let plank = approval.requirement["kind"] == "plank_question";
             let multi = plank && approval.requirement["request"]["multi"] == true;
-            let selection_key = format!(
-                "question-{}-{}-{}",
-                session.id, session.generation, approval.id
-            );
+            let selection_key =
+                crate::questions::selection_key(&session.id, session.generation, approval);
             let selected = self.field(&selection_key);
-            let mut controls = div().flex().flex_wrap().gap_2();
-            for choice in &approval.choices {
-                let id = session.id.clone();
-                let approval_id = approval.id.clone();
-                let choice_id = choice.id.clone();
-                let requirement = approval.requirement.clone();
-                let key = selection_key.clone();
-                let toggle = multi && choice_id != "0";
-                let label = if toggle {
-                    format!(
-                        "{} {}",
-                        if selected.split(',').any(|id| id == choice_id) {
-                            "☑"
-                        } else {
-                            "☐"
-                        },
-                        choice.label
-                    )
-                } else {
-                    choice.label.clone()
-                };
-                controls = controls.child(
-                    Button::new(
-                        SharedString::from(format!("approval-{approval_id}-{choice_id}")),
-                        label,
-                    )
-                    .size(ButtonSize::Xs)
-                    .disabled(self.remote_read_only(&session.id))
-                    .on_click(click(cx, move |view, _, cx| {
-                        if toggle {
-                            let current = view.field(&key);
-                            let mut choices: Vec<_> = current
-                                .split(',')
-                                .filter(|id| !id.is_empty())
-                                .map(str::to_owned)
-                                .collect();
-                            if choices.iter().any(|id| id == &choice_id) {
-                                choices.retain(|id| id != &choice_id);
-                            } else {
-                                choices.push(choice_id.clone());
-                            }
-                            view.fields.insert(key.clone(), choices.join(","));
-                            cx.notify();
-                            return;
-                        }
-                        view.command(Command::DecideApproval {
-                            session_id: id.clone(),
-                            approval_id: approval_id.clone(),
-                            choice_id: choice_id.clone(),
-                            requirement: requirement.clone(),
-                        });
-                        cx.notify();
-                    })),
-                );
-            }
+            let disabled = !self.connected || self.remote_read_only(&session.id);
+            let mut controls = div().flex().flex_col().gap_2().min_w_0();
             if multi {
-                let id = session.id.clone();
-                let approval_id = approval.id.clone();
-                let requirement = approval.requirement.clone();
+                for (choice_index, choice) in approval.choices.iter().enumerate() {
+                    let key = selection_key.clone();
+                    let choice_id = choice.id.clone();
+                    let weak = cx.entity().downgrade();
+                    controls = controls.child(
+                        Checkbox::new(SharedString::from(format!("{selection_key}-{}", choice.id)))
+                            .when(
+                                first_question == Some(&approval.id) && choice_index == 0,
+                                |checkbox| checkbox.focus_handle(self.question_focus.clone()),
+                            )
+                            .label(choice.label.clone())
+                            .checked(selected.split(',').any(|id| id == choice.id))
+                            .disabled(disabled)
+                            .on_change(move |_, _, cx| {
+                                let _ = weak.update(cx, |view, cx| {
+                                    let answer =
+                                        crate::questions::toggle(&view.field(&key), &choice_id);
+                                    view.fields.insert(key.clone(), answer);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+            } else {
+                let key = selection_key.clone();
+                let weak = cx.entity().downgrade();
                 controls = controls.child(
-                    Button::new(
-                        SharedString::from(format!("answer-{approval_id}")),
-                        "Answer",
-                    )
-                    .size(ButtonSize::Xs)
-                    .disabled(selected.is_empty() || self.remote_read_only(&session.id))
-                    .on_click(click(cx, move |view, _, cx| {
-                        view.command(Command::DecideApproval {
-                            session_id: id.clone(),
-                            approval_id: approval_id.clone(),
-                            choice_id: view.field(&selection_key),
-                            requirement: requirement.clone(),
-                        });
-                        cx.notify();
-                    })),
+                    RadioGroup::new(SharedString::from(selection_key.clone()))
+                        .when(first_question == Some(&approval.id), |group| {
+                            group.focus_handle(self.question_focus.clone())
+                        })
+                        .options(
+                            approval
+                                .choices
+                                .iter()
+                                .map(|choice| {
+                                    RadioOption::new(choice.id.clone(), choice.label.clone())
+                                })
+                                .collect(),
+                        )
+                        .selected(
+                            (!selected.is_empty()).then(|| SharedString::from(selected.clone())),
+                        )
+                        .wrap_labels(true)
+                        .aria_label(approval.tool.clone())
+                        .disabled(disabled)
+                        .on_change(move |value, _, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.fields.insert(key.clone(), value.to_string());
+                                cx.notify();
+                            });
+                        }),
                 );
             }
-            composer = composer.child(
+            let id = session.id.clone();
+            let generation = session.generation;
+            let approval_id = approval.id.clone();
+            let requirement = approval.requirement.clone();
+            controls = controls.child(
+                div().flex().child(
+                    Button::new(
+                        SharedString::from(format!("answer-{selection_key}")),
+                        "Confirm answer",
+                    )
+                    .disabled(disabled || !approval.accepts_choice(&selected))
+                    .on_click(click(cx, move |view, _, cx| {
+                        let answer = view.field(&selection_key);
+                        let valid = view.connected
+                            && !view.remote_read_only(&id)
+                            && view
+                                .snapshot
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == id)
+                                .is_some_and(|session| {
+                                    session.generation == generation
+                                        && session.approvals.iter().any(|pending| {
+                                            pending.id == approval_id
+                                                && pending.requirement == requirement
+                                                && pending.accepts_choice(&answer)
+                                        })
+                                });
+                        if valid {
+                            view.command(Command::DecideApproval {
+                                session_id: id.clone(),
+                                approval_id: approval_id.clone(),
+                                choice_id: answer,
+                                requirement: requirement.clone(),
+                            });
+                        }
+                        cx.notify();
+                    })),
+                ),
+            );
+            questions = questions.child(
                 div()
                     .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .min_w_0()
                     .child(format!(
                         "{}: {}",
                         if plank { "Question" } else { "Approval needed" },
@@ -2787,34 +6946,93 @@ impl WorkspaceView {
                     ),
             );
         }
+        let drop_session = session.id.clone();
+        let weak = cx.entity().downgrade();
         div()
             .flex()
             .flex_col()
             .h_full()
             .min_h_0()
+            .on_drop::<gpui::ExternalPaths>(move |dropped, _window, cx| {
+                let paths = dropped.paths().to_vec();
+                let session_id = drop_session.clone();
+                let _ = weak.update(cx, |view, cx| {
+                    view.attach_files(&session_id, paths, cx);
+                });
+            })
+            .child({
+                let mut tabs = div().flex().flex_wrap().gap_1();
+                let peers: Vec<_> = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .filter(|peer| {
+                        !peer.archived
+                            && !self.preferences.closed_tabs.contains(&peer.id)
+                            && peer.workspace_id == session.workspace_id
+                            && crate::navigation::session_group_worktree(&self.snapshot, peer)
+                                .map(|tree| &tree.id)
+                                .or(peer.worktree_id.as_ref())
+                                == crate::navigation::session_group_worktree(
+                                    &self.snapshot,
+                                    session,
+                                )
+                                .map(|tree| &tree.id)
+                                .or(session.worktree_id.as_ref())
+                    })
+                    .collect();
+                if peers.len() > 1 {
+                    for peer in peers {
+                        let id = peer.id.clone();
+                        tabs = tabs.child(
+                            Button::new(
+                                SharedString::from(format!("checkout-tab-{}", peer.id)),
+                                peer.name.clone(),
+                            )
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .selected(peer.id == session.id)
+                            .on_click(click(cx, move |view, _, cx| {
+                                view.select(id.clone());
+                                cx.notify();
+                            })),
+                        );
+                    }
+                }
+                tabs
+            })
             .child(
-                div().p_2().border_b_1().border_color(colors.surface).child(
-                    layout! { H[g2] {} }
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(session.name.clone()),
-                        )
-                        .child(div().text_color(colors.muted).child(format!(
-                            "{} · {}",
-                            backend_label(&session.backend),
-                            state_label(session)
-                        )))
-                        .child(self.task_toggle(session, cx))
-                        .child(
-                            layout! { B.ghost("Details") #details }
-                                .size(ButtonSize::Xs)
-                                .on_click(click(cx, |view, _, cx| {
-                                    view.details = !view.details;
-                                    cx.notify();
-                                })),
-                        ),
-                ),
+                div()
+                    .px_2()
+                    .py(px(5.0))
+                    .border_b_1()
+                    .border_color(colors.surface)
+                    .child(
+                        layout! { H[g2] {} }
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(format!("Session · {}", session.name)),
+                            )
+                            .child(self.provider_badge(&session.backend))
+                            .child(
+                                div()
+                                    .text_color(colors.muted)
+                                    .text_xs()
+                                    .child(state_label(session)),
+                            )
+                            .child(self.task_toggle(session, cx))
+                            .child(div().flex_1())
+                            .child(self.pane_controls(cx))
+                            .child(
+                                layout! { B.ghost("Details") #details }
+                                    .size(ButtonSize::Xs)
+                                    .on_click(click(cx, |view, _, cx| {
+                                        view.details = !view.details;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
             .child({
                 let summary = self
@@ -2823,14 +7041,30 @@ impl WorkspaceView {
                     .get(&session.id)
                     .map(crate::model::EngineTelemetry::summary)
                     .unwrap_or_default();
+                let summary = if !session.state.busy()
+                    && let Some((elapsed, generated)) = self.run_summaries.get(&session.id)
+                {
+                    let last = format!(
+                        "Last run {} · {generated} tokens generated",
+                        crate::fleet::format_elapsed(*elapsed)
+                    );
+                    if summary.is_empty() {
+                        last
+                    } else {
+                        format!("{summary} · {last}")
+                    }
+                } else {
+                    summary
+                };
                 let mut row = div();
-                if !summary.is_empty() {
+                if self.preferences.diagnostics && !summary.is_empty() {
                     row = row.px_2().text_xs().text_color(colors.muted).child(summary);
                 }
                 row
             })
             .child(self.task_panel(session, cx))
             .child(transcript)
+            .child(questions)
             .child(div().p_2().child(composer))
             .into_any_element()
     }
@@ -2920,7 +7154,7 @@ impl WorkspaceView {
         let weak = cx.entity().downgrade();
         row = row.child(
             div().flex_1().min_w(px(100.0)).child(
-                Input::new(SharedString::from(key))
+                self.scoped_input(SharedString::from(key))
                     .focus_handle(self.task_form_focus.clone())
                     .aria_label(match form {
                         TaskForm::Goal => "Goal objective",
@@ -2947,7 +7181,7 @@ impl WorkspaceView {
             let weak = cx.entity().downgrade();
             row = row.child("Max turns").child(
                 div().w(px(60.0)).child(
-                    Input::new(SharedString::from(cap_key.clone()))
+                    self.scoped_input(SharedString::from(cap_key.clone()))
                         .aria_label("Maximum goal iterations")
                         .size(gpui_ui_kit::InputSize::Sm)
                         .value(iterations)
@@ -4056,7 +8290,7 @@ impl WorkspaceView {
                         )
                         .child(
                             div().flex_1().min_w_0().child(
-                                Input::new(SharedString::from(key.clone()))
+                                self.scoped_input(SharedString::from(key.clone()))
                                     .value(value)
                                     .placeholder(name.clone())
                                     .disabled(self.remote_read_only(&session.id))
@@ -4166,7 +8400,7 @@ impl WorkspaceView {
         let text_key = key.clone();
         row = row.child(
             div().flex_1().min_w(px(100.0)).child(
-                Input::new(SharedString::from(key))
+                self.scoped_input(SharedString::from(key))
                     .size(gpui_ui_kit::InputSize::Sm)
                     .focus_handle(self.conversation_form_focus.clone())
                     .aria_label(label)
@@ -4448,7 +8682,7 @@ impl WorkspaceView {
             .gap_1()
             .child(
                 div().w(px(180.0)).child(
-                    Input::new(SharedString::from(key.clone()))
+                    self.scoped_input(SharedString::from(key.clone()))
                         .size(gpui_ui_kit::InputSize::Sm)
                         .placeholder("Loaded component ID")
                         .aria_label("Component settings ID")
@@ -4636,7 +8870,8 @@ impl WorkspaceView {
                 .unwrap_or_else(|| field.value.clone());
             let weak = cx.entity().downgrade();
             let edit_key = key.clone();
-            let input = Input::new(SharedString::from(key.clone()))
+            let input = self
+                .scoped_input(SharedString::from(key.clone()))
                 .size(gpui_ui_kit::InputSize::Sm)
                 .value(value.clone())
                 .placeholder(field.hint.clone())
@@ -5326,7 +9561,7 @@ impl WorkspaceView {
         let edit_key = key.clone();
         row = row.child(
             div().w(px(220.0)).child(
-                Input::new(SharedString::from(key.clone()))
+                self.scoped_input(SharedString::from(key.clone()))
                     .size(gpui_ui_kit::InputSize::Sm)
                     .value(text.clone())
                     .focus_handle(self.frame_text_focus.clone())
@@ -7272,56 +11507,58 @@ impl WorkspaceView {
             let selection_key = key.clone();
             let selection_id = id.clone();
             let selection_weak = cx.entity().downgrade();
-            let mut input =
-                crate::editor_input::Input::new(SharedString::from(format!("document-line-{id}")))
-                    .size(crate::editor_input::InputSize::Sm)
-                    .value(line.text.clone())
-                    .on_native_edit(move |edit, _, cx| {
-                        native_weak
-                            .update(cx, |view, cx| {
-                                let result = view
-                                    .documents
-                                    .get_mut(&native_key)?
-                                    .native_edit(&native_id, edit);
-                                view.draft_dirty = true;
-                                cx.notify();
-                                result
-                            })
-                            .ok()
-                            .flatten()
+            let mut input = crate::editor_input::Input::new(SharedString::from(format!(
+                "document-line-{}-{id}",
+                self.key_scope
+            )))
+            .size(crate::editor_input::InputSize::Sm)
+            .value(line.text.clone())
+            .on_native_edit(move |edit, _, cx| {
+                native_weak
+                    .update(cx, |view, cx| {
+                        let result = view
+                            .documents
+                            .get_mut(&native_key)?
+                            .native_edit(&native_id, edit);
+                        view.draft_dirty = true;
+                        cx.notify();
+                        result
                     })
-                    .on_text_change(move |text, _, cx| {
-                        let _ = weak.update(cx, |view, cx| {
-                            if let Some(document) = view.documents.get_mut(&text_key) {
-                                document.set(&text_id, text);
-                            }
-                            view.draft_dirty = true;
-                            cx.notify();
-                        });
-                    })
-                    .on_selection_change(move |selection, _, cx| {
-                        let _ = selection_weak.update(cx, |view, cx| {
-                            if let Some(document) = view.documents.get_mut(&selection_key) {
-                                if selection.extend_document {
-                                    document.extend_to(&selection_id, selection.end);
-                                } else {
-                                    document.observe_selection(
-                                        &selection_id,
-                                        selection.start,
-                                        selection.end,
-                                        selection.reversed,
-                                    );
-                                }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .document_selection(document.line_selection(index))
-                    .document_pointer(
-                        key.clone().into(),
-                        std::rc::Rc::clone(&self.document_pointer),
-                    )
-                    .on_edit_end(document_edit_end(cx, end_key, end_id));
+                    .ok()
+                    .flatten()
+            })
+            .on_text_change(move |text, _, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    if let Some(document) = view.documents.get_mut(&text_key) {
+                        document.set(&text_id, text);
+                    }
+                    view.draft_dirty = true;
+                    cx.notify();
+                });
+            })
+            .on_selection_change(move |selection, _, cx| {
+                let _ = selection_weak.update(cx, |view, cx| {
+                    if let Some(document) = view.documents.get_mut(&selection_key) {
+                        if selection.extend_document {
+                            document.extend_to(&selection_id, selection.end);
+                        } else {
+                            document.observe_selection(
+                                &selection_id,
+                                selection.start,
+                                selection.end,
+                                selection.reversed,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .document_selection(document.line_selection(index))
+            .document_pointer(
+                key.clone().into(),
+                std::rc::Rc::clone(&self.document_pointer),
+            )
+            .on_edit_end(document_edit_end(cx, end_key, end_id));
             if let Some(navigation) = &document.navigation
                 && navigation.line_id == id
             {
@@ -7482,7 +11719,7 @@ impl WorkspaceView {
         actions = actions
             .child(
                 div().w(px(70.0)).child(
-                    Input::new(SharedString::from(line_key.clone()))
+                    self.scoped_input(SharedString::from(line_key.clone()))
                         .size(gpui_ui_kit::InputSize::Sm)
                         .placeholder("Line")
                         .aria_label(format!("Go to line, 1 through {}", document.lines.len()))
@@ -7659,7 +11896,7 @@ impl WorkspaceView {
             .gap_1()
             .child(
                 div().w(px(180.0)).child(
-                    Input::new(SharedString::from(format!("document-search-{key}")))
+                    self.scoped_input(SharedString::from(format!("document-search-{key}")))
                         .focus_handle(self.document_search_focus.clone())
                         .size(gpui_ui_kit::InputSize::Sm)
                         .placeholder("Find (case sensitive)")
@@ -7700,7 +11937,7 @@ impl WorkspaceView {
         let weak = cx.entity().downgrade();
         row = row.child(
             div().w(px(160.0)).child(
-                Input::new(SharedString::from(format!("document-replace-{key}")))
+                self.scoped_input(SharedString::from(format!("document-replace-{key}")))
                     .size(gpui_ui_kit::InputSize::Sm)
                     .placeholder("Replace with")
                     .value(document.search.replacement.clone())
@@ -7936,6 +12173,13 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = self.pane_size.unwrap_or_else(|| window.viewport_size());
+        if window.focused(cx).is_none() {
+            self.workspace_focus.focus(window, cx);
+        }
+        if let Some(id) = &self.selected {
+            self.transcript_scroll.entry(id.clone()).or_default();
+        }
         if self.focus_subscription.is_none() {
             self.focus_active = window.is_window_active();
             self.focus_subscription =
@@ -7966,20 +12210,80 @@ impl Render for WorkspaceView {
                         .take(crate::document::PAGE_LINES)
                     {
                         visible_inputs.insert(gpui::ElementId::from(SharedString::from(format!(
-                            "document-line-{}",
-                            line.id
+                            "document-line-{}-{}",
+                            self.key_scope, line.id
                         ))));
                     }
                 }
             }
         }
-        crate::editor_input::cleanup_stale_input_states(&visible_inputs);
+        if self.pane_parent.is_none() && self.pane_splits.is_empty() {
+            crate::editor_input::cleanup_stale_input_states(&visible_inputs);
+        }
         if self.focus_commands {
             self.command_focus.focus(window, cx);
             self.focus_commands = false;
         }
         let colors = WorkspaceTheme::from(cx.theme().as_ref());
-        let compact = window.viewport_size().width < px(700.0);
+        let compact = viewport.width < px(700.0);
+        let sidebar_px = if self.sidebar_width > 0.0 {
+            self.sidebar_width
+        } else if compact {
+            210.0
+        } else {
+            270.0
+        };
+        let docked_navigation = self
+            .preferences
+            .navigation
+            .docked(f32::from(viewport.width), sidebar_px);
+        // The rail remains an easy touch target while consuming little horizontal space.
+        let navigation_width = if self.appearance_only {
+            0.0
+        } else if docked_navigation {
+            sidebar_px + 6.0
+        } else {
+            32.0
+        };
+        let (attention, attention_count) =
+            crate::navigation::attention_summary(&self.snapshot.sessions, self.connected);
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if let Some(index) = self.active_terminal
+            && let Some(terminal) = self.terminals.get(index)
+        {
+            // Fit the grid to the content area using a shaped Menlo probe.
+
+            let mut content_w = f32::from(viewport.width) - navigation_width;
+            let mut content_h = f32::from(viewport.height) - 130.0;
+            for (vertical, _) in &self.pane_splits {
+                if *vertical {
+                    content_w = (content_w - 1.0) / 2.0;
+                } else {
+                    content_h = (content_h - 1.0) / 2.0;
+                }
+            }
+            let avail_w = (content_w - 24.0).max(80.0);
+            let avail_h = content_h.max(60.0);
+            let probe_run = gpui::TextRun {
+                len: 10,
+                font: gpui::font("Menlo"),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let probe =
+                window
+                    .text_system()
+                    .shape_line("MMMMMMMMMM".into(), px(13.0), &[probe_run], None);
+            let cell_w = (f32::from(probe.width) / 10.0).max(1.0);
+            let cols = (avail_w / cell_w).floor() as u16;
+            let rows = (avail_h / 17.0).floor() as u16;
+            if cols >= 10 && rows >= 3 && terminal.size() != (usize::from(cols), usize::from(rows))
+            {
+                let _ = terminal.resize(cols, rows);
+            }
+        }
         let selected = self
             .selected
             .as_ref()
@@ -7992,44 +12296,218 @@ impl Render for WorkspaceView {
                 .h_full()
                 .child(self.appearance_panel(cx))
                 .into_any_element()
+        } else if self.show_terminal() {
+            self.terminal_panel(&colors, cx)
+        } else if self.show_fleet {
+            self.fleet_panel(&colors, cx)
+        } else if self.show_ci {
+            self.ci_panel(&colors, cx)
+        } else if self.show_docs {
+            self.docs_panel(&colors, cx)
+        } else if self.show_monitor {
+            self.monitor_panel(&colors, cx)
         } else if let Some(session) = selected {
             self.conversation(session, &colors, cx)
         } else {
             div().p_6().child(layout! { V[g6] { Hd "Your agents, one workspace" [level="1"], Tx "Create a workspace, then add local, remote, or demo sessions." [muted] }}).into_any_element()
         };
-        let mut body = div().flex().flex_1().min_h_0();
+        let mut body = div().relative().flex().flex_1().min_h_0();
         // Requests have been copied into this frame's input props. Keeping them
         // in the document would replay a focus change when revisiting a page.
         for document in self.documents.values_mut() {
             document.navigation = None;
         }
-        if !self.appearance_only && (!compact || self.mobile_sidebar) {
+        if !self.appearance_only && docked_navigation {
+            body = body
+                .child(
+                    div()
+                        .w(px(sidebar_px))
+                        .flex_shrink_0()
+                        .child(self.sidebar(&colors, cx)),
+                )
+                .child(
+                    div()
+                        .w(px(6.0))
+                        .flex_shrink_0()
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|view, event: &gpui::MouseDownEvent, _, cx| {
+                                view.sidebar_drag = true;
+                                view.sidebar_width =
+                                    f32::from(event.position.x).clamp(180.0, 520.0);
+                                cx.notify();
+                            }),
+                        ),
+                );
+        }
+        if !self.appearance_only && !docked_navigation {
+            let rail_color = match attention {
+                crate::navigation::AttentionLevel::Clear => cx.theme().success,
+                crate::navigation::AttentionLevel::Pending => cx.theme().warning,
+                crate::navigation::AttentionLevel::Required => cx.theme().error,
+                crate::navigation::AttentionLevel::Unknown => colors.muted,
+            };
             body = body.child(
                 div()
-                    .w(px(if compact { 210.0 } else { 270.0 }))
+                    .w(px(32.0))
                     .flex_shrink_0()
-                    .child(self.sidebar(&colors, cx)),
+                    .h_full()
+                    .bg(colors.surface)
+                    .border_l_4()
+                    .border_color(rail_color)
+                    .child(
+                        Button::new("navigation-status", attention.symbol())
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .aria_label(format!(
+                                "Open projects: {} ({attention_count})",
+                                attention.label()
+                            ))
+                            .expanded(self.mobile_sidebar)
+                            .on_click(click(cx, |view, window, cx| {
+                                view.mobile_sidebar = !view.mobile_sidebar;
+                                if view.mobile_sidebar {
+                                    view.navigation_focus.focus(window, cx);
+                                } else {
+                                    view.composer_focus.focus(window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_xs().text_center().child(if attention_count > 0 {
+                        attention_count.to_string()
+                    } else {
+                        String::new()
+                    })),
             );
+        }
+        let content = if compact && self.details && !self.show_new && !self.appearance {
+            selected.map_or(content, |session| self.details_panel(session, cx))
+        } else {
+            content
+        };
+        let mut content = content;
+        if self.show_terminal()
+            || self.show_fleet
+            || self.show_ci
+            || self.show_docs
+            || self.show_monitor
+        {
+            content = div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(self.overview_buttons(true, cx))
+                        .child(self.pane_controls(cx)),
+                )
+                .child(div().flex_1().min_h_0().child(content))
+                .into_any_element();
+        }
+        for (vertical, pane) in &self.pane_splits {
+            content = div()
+                .flex()
+                .when(!*vertical, |d| d.flex_col())
+                .size_full()
+                .min_h_0()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(content),
+                )
+                .child(
+                    div()
+                        .when(*vertical, |d| d.w(px(1.0)))
+                        .when(!*vertical, |d| d.h(px(1.0)))
+                        .bg(colors.muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(pane.clone()),
+                )
+                .into_any_element();
         }
         body = body.child(div().flex_1().min_w_0().h_full().child(content));
         if self.details
+            && !compact
             && !self.show_new
             && !self.appearance
             && let Some(session) = selected
         {
             let details = self.details_panel(session, cx);
-            if compact {
-                body = div().flex_1().min_h_0().child(details);
-            } else {
-                body = body.child(div().w(px(300.0)).flex_shrink_0().child(details));
-            }
+            body = body.child(div().w(px(300.0)).flex_shrink_0().child(details));
+        }
+        if !self.appearance_only && !docked_navigation && self.mobile_sidebar {
+            body = body
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .left(px(32.0))
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.25))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.mobile_sidebar = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(32.0))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(sidebar_px.min(f32::from(viewport.width) - 48.0)))
+                        .child(self.sidebar(&colors, cx)),
+                );
         }
         let mut root = div()
+            .id(SharedString::from(self.key_scope.clone()))
+            .key_context(self.key_scope.as_str())
+            .track_focus(&self.workspace_focus)
+            .on_action(cx.listener(
+                |view, action: &crate::shortcuts::ExecuteCommand, window, cx| {
+                    view.execute_ui_command(&action.name, window, cx);
+                    cx.stop_propagation();
+                },
+            ))
             .capture_key_down(
                 cx.listener(|view, event, window, cx| view.control_key(event, window, cx)),
             )
-            .w(window.viewport_size().width)
-            .h(window.viewport_size().height)
+            .relative()
+            .size_full()
+            .child({
+                let weak = cx.entity().downgrade();
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            if view.pane_size != Some(bounds.size) {
+                                view.pane_size = Some(bounds.size);
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0()
+            })
             .overflow_hidden()
             .font_family(ui_font())
             .text_size(px(14.0))
@@ -8038,7 +12516,7 @@ impl Render for WorkspaceView {
             .bg(colors.background)
             .text_color(colors.text);
         #[cfg(target_os = "macos")]
-        {
+        if self.pane_parent.is_none() {
             let utilization = self.meters;
             let meter = |icon: &'static str, value: Option<u8>| {
                 div()
@@ -8082,29 +12560,47 @@ impl Render for WorkspaceView {
                             window.titlebar_double_click();
                         }
                     })
-                    .child(div().flex_1().min_w_0().child(if self.appearance {
-                        "Preferences".to_owned()
+                    .child(
+                        Button::new("topbar-new-session", "+ New session")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, |view, _, cx| view.add_agent(None, cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(self.overview_buttons(f32::from(viewport.width) < 900.0, cx))
+                    .children(if self.preferences.diagnostics {
+                        self.titlebar_chips(&colors, cx)
                     } else {
-                        self.snapshot
-                            .sessions
-                            .iter()
-                            .find(|session| Some(&session.id) == self.selected.as_ref())
-                            .map(|session| session.name.clone())
-                            .unwrap_or_default()
-                    }))
-                    .child(meter("icons/cpu.svg", utilization.cpu))
-                    .child(meter("icons/gpu.svg", utilization.gpu)),
+                        Vec::new()
+                    })
+                    .children(
+                        self.preferences
+                            .diagnostics
+                            .then(|| meter("icons/cpu.svg", utilization.cpu)),
+                    )
+                    .children(
+                        self.preferences
+                            .diagnostics
+                            .then(|| meter("icons/gpu.svg", utilization.gpu)),
+                    ),
             );
         }
-        if compact && !self.appearance_only {
+        #[cfg(not(target_os = "macos"))]
+        if self.pane_parent.is_none() {
             root = root.child(
-                layout! { B.ghost("Workspaces") #mobile_workspaces }.on_click(click(
-                    cx,
-                    |view, _, cx| {
-                        view.mobile_sidebar = !view.mobile_sidebar;
-                        cx.notify();
-                    },
-                )),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .h(px(36.0))
+                    .child(
+                        Button::new("topbar-new-session", "+ New session")
+                            .size(ButtonSize::Xs)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(click(cx, |view, _, cx| view.add_agent(None, cx))),
+                    )
+                    .child(self.overview_buttons(f32::from(viewport.width) < 900.0, cx)),
             );
         }
         if let Some(error) = &self.error {
@@ -8141,13 +12637,187 @@ impl Render for WorkspaceView {
                 .text_xs()
                 .text_color(colors.muted)
                 .child(if self.appearance {
-                    "Appearance preferences apply to other open windows"
-                } else if self.connected {
-                    "Connected · execution continues when this window closes"
+                    "Appearance preferences apply to other open windows".to_owned()
                 } else {
-                    "Connecting to Plank daemon…"
+                    format!(
+                        "{} {} · {} sessions need action · {} projects",
+                        attention.symbol(),
+                        attention.label(),
+                        attention_count,
+                        self.shortcuts
+                            .get_documented(self.preferences.keymap)
+                            .iter()
+                            .find(|binding| binding.description == "Toggle navigator")
+                            .map_or("", |binding| binding.key.as_str())
+                    )
                 }),
         );
+        if let Some((menu_id, position)) = self.session_menu.clone() {
+            root = root
+                .relative()
+                .child(div().absolute().inset_0().on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        view.session_menu = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .left(position.x)
+                        .top(position.y)
+                        .child(self.session_menu_panel(&menu_id, &colors, cx)),
+                );
+        }
+        if self.show_preflight {
+            root = root.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                    .p_4()
+                    .child(self.preflight_panel(&colors, cx)),
+            );
+        }
+        if !self.field("worktree-workspace").is_empty() {
+            root = root.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                    .p_4()
+                    .child(
+                        div()
+                            .id("worktrees-popup")
+                            .w(px(620.0))
+                            .max_w_full()
+                            .max_h_full()
+                            .overflow_y_scroll()
+                            .bg(colors.background)
+                            .p_4()
+                            .child(self.worktrees_panel(cx)),
+                    ),
+            );
+        }
+        if self.show_palette || self.show_shortcuts {
+            let content = if self.show_palette {
+                self.app_palette(cx)
+            } else {
+                self.shortcuts_panel(cx)
+            };
+            root = root.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                    .p_4()
+                    .child(
+                        div()
+                            .id("keyboard-popup")
+                            .w(px(620.0))
+                            .max_w_full()
+                            .max_h_full()
+                            .overflow_y_scroll()
+                            .bg(colors.background)
+                            .p_4()
+                            .child(content),
+                    ),
+            );
+        }
+        if let Some(confirm) = self.confirm.clone() {
+            let message = match &confirm {
+                Confirm::RemoveWorktree(id) => format!(
+                    "Remove checkout {}? All sessions must be stopped and archived. Git will refuse dirty or locked checkouts. The branch and transcript history are kept.",
+                    self.snapshot
+                        .worktrees
+                        .iter()
+                        .find(|tree| &tree.id == id)
+                        .map_or(id.as_str(), |tree| tree.directory.as_str())
+                ),
+                Confirm::CloseTerminal(_) => "Close this terminal and kill its process?".to_owned(),
+                Confirm::CloseWorkspace(id) => format!(
+                    "Close workspace “{}”? Sessions keep running and stay reachable under Machines.",
+                    self.snapshot
+                        .workspaces
+                        .iter()
+                        .find(|w| &w.id == id)
+                        .map_or("Workspace", |w| w.name.as_str())
+                ),
+                Confirm::DeleteDashboard(name) => format!(
+                    "Delete dashboard “{name}”? This removes its JSON file from the workspace."
+                ),
+            };
+            root = root.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .rounded(px(8.0))
+                            .bg(colors.background)
+                            .border_1()
+                            .border_color(colors.muted)
+                            .child(div().text_size(px(13.0)).child(message))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("confirm-cancel", "Cancel")
+                                            .variant(ButtonVariant::Ghost)
+                                            .on_click(click(cx, |view, _, cx| {
+                                                view.confirm = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("confirm-ok", "Close")
+                                            .variant(ButtonVariant::Primary)
+                                            .on_click(click(cx, |view, _, cx| {
+                                                view.perform_confirmed(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+        root = root
+            .on_mouse_move(cx.listener(|view, event: &gpui::MouseMoveEvent, _, cx| {
+                if view.sidebar_drag {
+                    view.sidebar_width = f32::from(event.position.x).clamp(180.0, 520.0);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    if view.sidebar_drag {
+                        view.sidebar_drag = false;
+                        view.preferences.sidebar_width = Some(view.sidebar_width);
+                        view.save_preferences();
+                        cx.notify();
+                    }
+                }),
+            );
         if self.show_new {
             root = root.relative().child(
                 div()
@@ -8235,6 +12905,96 @@ fn state_label(session: &Session) -> &'static str {
     }
 }
 
+/// Converts a terminal RGB triple into a GPUI color.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn term_hsla((r, g, b): (u8, u8, u8)) -> gpui::Hsla {
+    gpui::Rgba {
+        r: f32::from(r) / 255.0,
+        g: f32::from(g) / 255.0,
+        b: f32::from(b) / 255.0,
+        a: 1.0,
+    }
+    .into()
+}
+
+/// Splits the run under the cursor so it can render inverted.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn cursor_runs(
+    row: &[crate::terminal::Run],
+    cursor: Option<(usize, usize)>,
+    row_index: usize,
+) -> Vec<crate::terminal::Run> {
+    let Some((col, cursor_row)) = cursor else {
+        return row.to_vec();
+    };
+    if cursor_row != row_index {
+        return row.to_vec();
+    }
+    let mut out: Vec<crate::terminal::Run> = Vec::new();
+    let mut offset = 0usize;
+    for run in row {
+        let width = run.text.chars().count();
+        if col >= offset && col < offset + width {
+            let at = col - offset;
+            let mut chars = run.text.chars();
+            let before: String = chars.by_ref().take(at).collect();
+            let head: String = chars.by_ref().take(1).collect();
+            let after: String = chars.collect();
+            if !before.is_empty() {
+                let mut part = run.clone();
+                part.text = before;
+                out.push(part);
+            }
+            if !head.is_empty() {
+                let mut part = run.clone();
+                part.text = head;
+                std::mem::swap(&mut part.fg, &mut part.bg);
+                out.push(part);
+            }
+            if !after.is_empty() {
+                let mut part = run.clone();
+                part.text = after;
+                out.push(part);
+            }
+        } else {
+            out.push(run.clone());
+        }
+        offset += width;
+    }
+    out
+}
+
+/// Formats a byte count compactly (`800 B`, `12 KB`, `3.1 MB`).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    }
+}
+
+/// Renders a unified diff with added/removed line tinting.
+fn diff_lines(text: &str) -> gpui::AnyElement {
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .font_family("Menlo")
+        .text_size(px(12.0));
+    for line in text.lines() {
+        let bg = if line.starts_with('+') && !line.starts_with("+++") {
+            gpui::hsla(0.36, 0.55, 0.45, 0.16)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            gpui::hsla(0.0, 0.65, 0.5, 0.16)
+        } else {
+            gpui::hsla(0.0, 0.0, 0.0, 0.0)
+        };
+        body = body.child(div().bg(bg).px_1().child(line.to_owned()));
+    }
+    body.into_any_element()
+}
+
 fn document_key(session_id: &str, editor: &crate::model::PendingApproval) -> String {
     format!(
         "{session_id}:{}:{}",
@@ -8276,6 +13036,135 @@ fn document_edit_end(
     }
 }
 
+/// Series color (0xRRGGBB) from the d3rs category10 scheme, by index.
+fn mon_series_hex(index: usize) -> u32 {
+    let scheme = d3rs::color::ColorScheme::category10();
+    let colors = scheme.colors();
+    let color = &colors[index % colors.len()];
+    let byte = |component: f32| ((component.clamp(0.0, 1.0) * 255.0) as u32) & 0xff;
+    (byte(color.r) << 16) | (byte(color.g) << 8) | byte(color.b)
+}
+
+/// Series paint color from the d3rs category10 scheme, cycling by index.
+fn mon_series_color(index: usize) -> gpui::Rgba {
+    gpui::rgb(mon_series_hex(index))
+}
+
+/// Line/area chart canvas: d3rs linear scales, ticks, and monotone-x
+/// curves painted as GPUI paths.
+fn mon_line_canvas(series: Vec<crate::prom::Series>, filled: bool) -> gpui::AnyElement {
+    use d3rs::scale::{LinearScale, Scale};
+    let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for one in &series {
+        for (ts, value) in &one.points {
+            xmin = xmin.min(*ts as f64);
+            xmax = xmax.max(*ts as f64);
+            ymin = ymin.min(*value);
+            ymax = ymax.max(*value);
+        }
+    }
+    if !xmin.is_finite() {
+        return div().into_any_element();
+    }
+    if (xmax - xmin).abs() < f64::EPSILON {
+        xmax = xmin + 1.0;
+    }
+    if (ymax - ymin).abs() < f64::EPSILON {
+        ymax = ymin + 1.0;
+    }
+    // Small headroom so peaks do not touch the card edge.
+    ymax += (ymax - ymin) * 0.05;
+    let ticks = LinearScale::new().domain(ymin, ymax).ticks(4);
+    gpui::canvas(
+        move |_bounds, _window, _cx| (series, ticks, (xmin, xmax, ymin, ymax)),
+        move |bounds, (series, ticks, (xmin, xmax, ymin, ymax)), window, _cx| {
+            let width: f64 = f64::from(f32::from(bounds.size.width));
+            let height: f64 = f64::from(f32::from(bounds.size.height));
+            let origin_x: f64 = f64::from(f32::from(bounds.origin.x));
+            let origin_y: f64 = f64::from(f32::from(bounds.origin.y));
+            let x_scale = LinearScale::new()
+                .domain(xmin, xmax)
+                .range(4.0, (width - 4.0).max(5.0));
+            let y_scale = LinearScale::new()
+                .domain(ymin, ymax)
+                .range((height - 4.0).max(1.0), 4.0);
+            let grid = gpui::hsla(0.0, 0.0, 0.5, 0.18);
+            for tick in &ticks {
+                let y = origin_y + y_scale.scale(*tick);
+                let mut path = gpui::PathBuilder::stroke(px(1.0));
+                path.move_to(gpui::point(px(origin_x as f32), px(y as f32)));
+                path.line_to(gpui::point(px((origin_x + width) as f32), px(y as f32)));
+                if let Ok(built) = path.build() {
+                    window.paint_path(built, grid);
+                }
+            }
+            for (index, one) in series.iter().enumerate() {
+                let points: Vec<d3rs::shape::path::Point> = one
+                    .points
+                    .iter()
+                    .map(|(ts, value)| {
+                        d3rs::shape::path::Point::new(
+                            x_scale.scale(*ts as f64),
+                            y_scale.scale(*value),
+                        )
+                    })
+                    .collect();
+                if points.is_empty() {
+                    continue;
+                }
+                let curve = d3rs::shape::curve::Curve::monotone_x().interpolate(&points);
+                let color = mon_series_color(index);
+                if filled {
+                    let base = y_scale.scale(ymin);
+                    let mut fill = gpui::PathBuilder::fill();
+                    fill.move_to(gpui::point(
+                        px((origin_x + curve[0].x) as f32),
+                        px((origin_y + base) as f32),
+                    ));
+                    for point in &curve {
+                        fill.line_to(gpui::point(
+                            px((origin_x + point.x) as f32),
+                            px((origin_y + point.y) as f32),
+                        ));
+                    }
+                    fill.line_to(gpui::point(
+                        px((origin_x + curve[curve.len() - 1].x) as f32),
+                        px((origin_y + base) as f32),
+                    ));
+                    fill.close();
+                    if let Ok(built) = fill.build() {
+                        // Same hue at ~25% alpha under the stroke.
+                        window.paint_path(built, gpui::rgba((mon_series_hex(index) << 8) | 0x40));
+                    }
+                }
+                let mut stroke = gpui::PathBuilder::stroke(px(1.5));
+                for (position, point) in curve.iter().enumerate() {
+                    let at = gpui::point(
+                        px((origin_x + point.x) as f32),
+                        px((origin_y + point.y) as f32),
+                    );
+                    if position == 0 {
+                        stroke.move_to(at);
+                    } else {
+                        stroke.line_to(at);
+                    }
+                }
+                if let Ok(built) = stroke.build() {
+                    window.paint_path(built, color);
+                }
+            }
+        },
+    )
+    .w_full()
+    .h(px(150.0))
+    .into_any_element()
+}
+
 fn click<F>(
     cx: &Context<WorkspaceView>,
     handler: F,
@@ -8289,10 +13178,56 @@ where
     }
 }
 
+/// Sniffs an image media type from magic bytes (not the file name).
+fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Reads an attachment as a prompt image when it really is one (≤10 MiB).
+/// Non-images and unreadable files return `None` and keep the path manifest.
+fn prompt_image_for(path: &std::path::Path) -> Option<PromptImage> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        return None;
+    }
+    let media_type = detect_image_media_type(&bytes)?;
+    Some(PromptImage {
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".into()),
+        media_type: media_type.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+}
+
+/// Whether an attachment path points at a displayable image (thumbnails).
+fn is_image_path(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    file.read_exact(&mut head)
+        .map(|()| detect_image_media_type(&head).is_some())
+        .unwrap_or(false)
+}
+
 fn backend_label(backend: &Backend) -> &'static str {
     match backend {
         Backend::Demo => "Demo",
-        Backend::Local { .. } => "Local Plank",
+        Backend::Local { .. } => "Plank",
         Backend::Remote { .. } => "Remote Plank",
         Backend::Agent { provider, .. } => provider.label(),
     }
@@ -8392,6 +13327,30 @@ fn merge_preferences(
     if current.selected != base.selected {
         disk.selected = current.selected.clone();
     }
+    if current.sidebar_width != base.sidebar_width {
+        disk.sidebar_width = current.sidebar_width;
+    }
+    if current.navigation != base.navigation {
+        disk.navigation = current.navigation;
+    }
+    if current.keymap != base.keymap {
+        disk.keymap = current.keymap;
+    }
+    if current.key_overrides != base.key_overrides {
+        disk.key_overrides = current.key_overrides.clone();
+    }
+    if current.diagnostics != base.diagnostics {
+        disk.diagnostics = current.diagnostics;
+    }
+    for id in current.closed_tabs.difference(&base.closed_tabs) {
+        disk.closed_tabs.insert(id.clone());
+    }
+    for id in base.closed_tabs.difference(&current.closed_tabs) {
+        disk.closed_tabs.remove(id);
+    }
+    if current.prometheus_url != base.prometheus_url {
+        disk.prometheus_url = current.prometheus_url.clone();
+    }
     disk
 }
 
@@ -8430,6 +13389,17 @@ fn persist_preferences_based(
         };
         current.theme = preferences.theme;
         current.design = preferences.design;
+        if let Some(base) = baseline {
+            if base.keymap != preferences.keymap {
+                current.keymap = preferences.keymap;
+            }
+            if base.key_overrides != preferences.key_overrides {
+                current.key_overrides = preferences.key_overrides.clone();
+            }
+            if base.diagnostics != preferences.diagnostics {
+                current.diagnostics = preferences.diagnostics;
+            }
+        }
         &current
     } else if let Some(baseline) = baseline {
         current = match std::fs::read(directory.join("preferences.json")) {
@@ -8451,7 +13421,7 @@ fn persist_preferences_based(
 
 #[cfg(target_family = "wasm")]
 fn appearance_preferences(preferences: &Preferences) -> String {
-    serde_json::json!({"theme":preferences.theme,"design":preferences.design}).to_string()
+    serde_json::json!({"theme":preferences.theme,"design":preferences.design,"keymap":preferences.keymap,"key_overrides":preferences.key_overrides,"diagnostics":preferences.diagnostics}).to_string()
 }
 
 #[cfg(target_family = "wasm")]
@@ -8469,6 +13439,9 @@ pub(crate) async fn restore_browser_preferences() -> anyhow::Result<Preferences>
         let appearance: Preferences = serde_json::from_str(&appearance)?;
         preferences.theme = appearance.theme;
         preferences.design = appearance.design;
+        preferences.keymap = appearance.keymap;
+        preferences.key_overrides = appearance.key_overrides;
+        preferences.diagnostics = appearance.diagnostics;
     }
     let appearance = appearance_preferences(&preferences);
     if stored.is_none()
@@ -8548,6 +13521,21 @@ async fn run_bridge(
         let mut frame_result: Option<Result<(), String>> = None;
         loop {
             match input.try_recv() {
+                Ok(Operation::WorktreeChanges(id, request)) => {
+                    let client = client.clone();
+                    let output = output.clone();
+                    let load = async move {
+                        let result = client
+                            .worktree_changes(&id)
+                            .await
+                            .map_err(|error| error.to_string());
+                        send_update(&output, Update::WorktreeChanges(request, result)).await;
+                    };
+                    #[cfg(not(target_family = "wasm"))]
+                    tokio::spawn(load);
+                    #[cfg(target_family = "wasm")]
+                    wasm_bindgen_futures::spawn_local(load);
+                }
                 Ok(Operation::Select(id, page)) => {
                     if selected != id {
                         aside_before = 0;
@@ -8564,7 +13552,10 @@ async fn run_bridge(
                     _ => {}
                 },
                 Ok(Operation::Command(command)) => {
-                    let select = matches!(command, Command::CreateSession { .. });
+                    let select = matches!(
+                        command,
+                        Command::CreateSession { .. } | Command::CreateWorktreeSession { .. }
+                    );
                     let workspace = matches!(command, Command::CreateWorkspace { .. });
                     let prompt = match &command {
                         Command::Prompt {
@@ -8864,7 +13855,11 @@ mod preference_persistence_tests {
     fn appearance_windows_preserve_the_latest_drafts_and_reject_corrupt_existing_state()
     -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
-        let mut current = Preferences::default();
+        let mut current = Preferences {
+            keymap: gpui_keybinding::KeymapPreset::Vim,
+            diagnostics: true,
+            ..Default::default()
+        };
         current.documents.insert(
             "editor".into(),
             crate::document::Document::new("latest unsaved 🦀"),
@@ -8888,6 +13883,8 @@ mod preference_persistence_tests {
         assert_eq!(recovered.drafts["session"], "latest prompt");
         assert_eq!(recovered.pending_prompts["session"].0, "request");
         assert_eq!((recovered.theme, recovered.design), (3, 2));
+        assert_eq!(recovered.keymap, gpui_keybinding::KeymapPreset::Vim);
+        assert!(recovered.diagnostics);
         let path = directory.path().join("preferences.json");
         std::fs::write(&path, "corrupt preferences")?;
         assert!(persist_preferences(directory.path(), &appearance, true).is_err());

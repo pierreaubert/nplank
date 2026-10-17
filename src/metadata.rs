@@ -67,13 +67,19 @@ pub(crate) fn start(daemon: &Arc<Daemon>) {
                 drop(daemon);
                 if let Ok(snapshot) = snapshot {
                     let mut git = HashMap::new();
-                    for workspace in &snapshot.workspaces {
+                    let directories: HashSet<&str> = snapshot
+                        .workspaces
+                        .iter()
+                        .map(|w| w.directory.as_str())
+                        .chain(snapshot.worktrees.iter().map(|t| t.directory.as_str()))
+                        .collect();
+                    for directory in directories {
                         let result = probe(
                             "git",
                             &[
                                 "--no-optional-locks",
                                 "-C",
-                                &workspace.directory,
+                                directory,
                                 "status",
                                 "--porcelain=v1",
                                 "--branch",
@@ -81,7 +87,7 @@ pub(crate) fn start(daemon: &Arc<Daemon>) {
                             ],
                         )
                         .await;
-                        git.insert(workspace.id.clone(), result.map(|text| parse_git(&text)));
+                        git.insert(directory, result.map(|text| parse_git(&text)));
                     }
                     let parents = if cfg!(unix) {
                         probe("ps", &["-axo", "pid=,ppid="]).await
@@ -96,7 +102,22 @@ pub(crate) fn start(daemon: &Arc<Daemon>) {
                     let mut contexts = HashMap::new();
                     for session in &snapshot.sessions {
                         let mut context = SessionContext::default();
-                        if let Some(Some((branch, dirty))) = git.get(&session.workspace_id) {
+                        let directory = if let Some(id) = &session.worktree_id {
+                            snapshot
+                                .worktrees
+                                .iter()
+                                .find(|tree| &tree.id == id)
+                                .map(|tree| tree.directory.as_str())
+                        } else {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .find(|workspace| workspace.id == session.workspace_id)
+                                .map(|workspace| workspace.directory.as_str())
+                        };
+                        if let Some(Some((branch, dirty))) =
+                            directory.and_then(|directory| git.get(directory))
+                        {
                             context.branch = branch.clone();
                             context.dirty = *dirty;
                         }

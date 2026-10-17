@@ -40,6 +40,7 @@ async fn console_exports_arrive_as_verified_downloads_and_reset_revokes_them() -
         session_id: session.clone(),
         request_id: "export-request".into(),
         text: "/export md".into(),
+        images: Vec::new(),
     })?;
     let (generation, export) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -89,6 +90,7 @@ async fn console_exports_arrive_as_verified_downloads_and_reset_revokes_them() -
         session_id: session.clone(),
         request_id: "preview-request".into(),
         text: "/open report.html".into(),
+        images: Vec::new(),
     })?;
     let preview = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -137,6 +139,7 @@ async fn console_exports_arrive_as_verified_downloads_and_reset_revokes_them() -
         session_id: session.clone(),
         request_id: "second-export-request".into(),
         text: "/export md".into(),
+        images: Vec::new(),
     })?;
     let newest = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

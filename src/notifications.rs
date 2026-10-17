@@ -206,6 +206,18 @@ impl Default for Delivery {
 #[cfg(all(feature = "gui", not(target_family = "wasm")))]
 impl Delivery {
     pub(crate) fn send(&self, notice: Notification) {
+        #[cfg(target_os = "macos")]
+        if nplank_macos_shim::inside_app_bundle() {
+            // UNUserNotificationCenter gives click-through to the session;
+            // only valid bundled, so unbundled builds keep notify-rust.
+            nplank_macos_shim::post_notification(
+                &notice.id,
+                &notice.title,
+                &notice.body,
+                &notice.session_id,
+            );
+            return;
+        }
         if let Some(sender) = &self.0 {
             let _ = sender.try_send(notice);
         }

@@ -35,6 +35,7 @@ fn prompt(id: &str, request: &str, text: &str) -> Command {
         session_id: id.into(),
         request_id: request.into(),
         text: text.into(),
+        images: Vec::new(),
     }
 }
 
@@ -1156,20 +1157,20 @@ fn remote_server_instances_scope_replay_ids_across_store_reopens_without_replayi
     let generation = store.session(&id)?.generation;
     store.accept_prompt(&id, "accepted-main", "Original request")?;
     store.set_state(&id, RunState::Idle, false)?;
-    store.append_remote(&id, 1, "assistant", "legacy answer")?;
-    store.append_remote(&other, 1, "assistant", "other session")?;
+    store.append_remote(&id, 1, "assistant", "legacy answer", None)?;
+    store.append_remote(&other, 1, "assistant", "other session", None)?;
     assert!(!store.bind_remote_instance(&id, generation, None)?);
-    store.append_remote(&id, 1, "assistant", "legacy duplicate")?;
+    store.append_remote(&id, 1, "assistant", "legacy duplicate", None)?;
     assert!(store.bind_remote_instance(&id, generation, Some("server-one"))?);
-    store.append_remote(&id, 1, "assistant", "first instance")?;
+    store.append_remote(&id, 1, "assistant", "first instance", None)?;
     assert!(!store.bind_remote_instance(&id, generation, Some("server-one"))?);
-    store.append_remote(&id, 1, "assistant", "same instance duplicate")?;
+    store.append_remote(&id, 1, "assistant", "same instance duplicate", None)?;
     drop(store);
     let mut store = Store::open(&database)?;
     assert!(!store.bind_remote_instance(&id, generation, Some("server-one"))?);
-    store.append_remote(&id, 1, "assistant", "reopened duplicate")?;
+    store.append_remote(&id, 1, "assistant", "reopened duplicate", None)?;
     assert!(store.bind_remote_instance(&id, generation, Some("server-two"))?);
-    store.append_remote(&id, 1, "assistant", "second instance")?;
+    store.append_remote(&id, 1, "assistant", "second instance", None)?;
     let snapshot = store.snapshot(Some(&id), 0)?;
     let answers = snapshot
         .entries
@@ -1216,7 +1217,7 @@ fn remote_instance_binding_refuses_stale_workers_and_malformed_ids_before_retiri
     store.reset(&id)?;
     let generation = store.session(&id)?.generation;
     assert!(!store.bind_remote_instance(&id, generation, Some("current"))?);
-    store.append_remote(&id, 1, "assistant", "current answer")?;
+    store.append_remote(&id, 1, "assistant", "current answer", None)?;
     assert!(
         store
             .bind_remote_instance(&id, old_generation, Some("stale"))
@@ -1234,7 +1235,7 @@ fn remote_instance_binding_refuses_stale_workers_and_malformed_ids_before_retiri
                 .is_err()
         );
     }
-    store.append_remote(&id, 1, "assistant", "must remain a duplicate")?;
+    store.append_remote(&id, 1, "assistant", "must remain a duplicate", None)?;
     assert_eq!(
         store
             .snapshot(Some(&id), 0)?
@@ -1245,9 +1246,9 @@ fn remote_instance_binding_refuses_stale_workers_and_malformed_ids_before_retiri
         1
     );
     assert!(store.bind_remote_instance(&id, generation, None)?);
-    store.append_remote(&id, 1, "assistant", "legacy downgrade")?;
+    store.append_remote(&id, 1, "assistant", "legacy downgrade", None)?;
     assert!(!store.bind_remote_instance(&id, generation, None)?);
-    store.append_remote(&id, 1, "assistant", "legacy duplicate")?;
+    store.append_remote(&id, 1, "assistant", "legacy duplicate", None)?;
     assert_eq!(
         store
             .snapshot(Some(&id), 0)?
@@ -1267,8 +1268,8 @@ fn remote_snapshot_replay_is_deduplicated_and_pages_are_bounded() -> Result<()> 
     let workspace =
         store.create_workspace("Project", directory.path().to_str().expect("temp path"))?;
     let id = store.create_session(&workspace, "Agent", Backend::Demo)?;
-    store.append_remote(&id, 1, "assistant", "once")?;
-    store.append_remote(&id, 1, "assistant", "once")?;
+    store.append_remote(&id, 1, "assistant", "once", None)?;
+    store.append_remote(&id, 1, "assistant", "once", None)?;
     assert_eq!(store.snapshot(Some(&id), 0)?.entries.len(), 1);
     for _ in 0..300 {
         store.append(&id, "assistant", "chunk")?;

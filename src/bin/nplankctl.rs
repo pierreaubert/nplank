@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
                         session_id: session.clone(),
                         request_id: uuid::Uuid::new_v4().to_string(),
                         text: "Explain how this session survives a window closing.".into(),
+                        images: Vec::new(),
                     })
                     .await?;
                 println!("{name}: {session}");

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::model::{Backend, Entry, RunState, Session, Snapshot, Workspace};
+use crate::model::{Backend, Entry, RunState, Session, Snapshot, Workspace, Worktree};
 
 /// A single-writer durable workspace database.
 #[derive(Debug)]
@@ -31,15 +31,16 @@ impl Store {
         let db = Connection::open(path)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 5,
             "Database was created by a newer nplank version"
         );
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
              CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS worktrees(id TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS entries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL);
+                 session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, kind TEXT);
              CREATE INDEX IF NOT EXISTS entries_session ON entries(session_id, sequence);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, text TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS remote_seen(session_id TEXT NOT NULL, id INTEGER NOT NULL,
@@ -50,6 +51,16 @@ impl Store {
              CREATE TABLE IF NOT EXISTS editor_document_chunks(session_id TEXT NOT NULL, approval_id TEXT NOT NULL,
                  offset INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(session_id, approval_id, offset));",
         )?;
+        // Schema v4: entries gain a nullable structural-kind column. Older
+        // databases keep every row; kind stays NULL (plain text) for them.
+        let has_kind: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entries') WHERE name='kind')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_kind {
+            db.execute("ALTER TABLE entries ADD COLUMN kind TEXT", [])?;
+        }
         let store = Self { db };
         let mut statement = store
             .db
@@ -131,7 +142,7 @@ impl Store {
         name: &str,
         backend: Backend,
     ) -> Result<String> {
-        self.workspace(workspace_id)?;
+        let workspace = self.workspace(workspace_id)?;
         ensure!(!name.trim().is_empty(), "Session name is required");
         if let Backend::Local { executable, args }
         | Backend::Agent {
@@ -190,6 +201,19 @@ impl Store {
             );
         }
         let session = Session {
+            worktree_id: if matches!(backend, Backend::Remote { .. }) {
+                None
+            } else {
+                self.snapshot(None, 0)?
+                    .worktrees
+                    .into_iter()
+                    .find(|tree| {
+                        tree.workspace_id == workspace_id
+                            && tree.directory == workspace.directory
+                            && !tree.removed
+                    })
+                    .map(|tree| tree.id)
+            },
             progress: None,
             controls: None,
             attention: false,
@@ -249,6 +273,172 @@ impl Store {
             })
             .context("Unknown workspace")?;
         Ok(serde_json::from_str(&data)?)
+    }
+
+    /// Reads an attached checkout by stable identifier.
+    ///
+    /// # Errors
+    /// Returns unknown-checkout or database errors.
+    pub fn worktree(&self, id: &str) -> Result<Worktree> {
+        let data: String = self
+            .db
+            .query_row("SELECT data FROM worktrees WHERE id=?1", [id], |r| r.get(0))
+            .context("Unknown worktree")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    /// Persists discovery results while preserving checkout and legacy session identities.
+    ///
+    /// # Errors
+    /// Returns invalid-workspace or database errors.
+    pub fn attach_worktrees(&self, trees: Vec<Worktree>) -> Result<Vec<String>> {
+        let snapshot = self.snapshot(None, 0)?;
+        let transaction = self.db.unchecked_transaction()?;
+        let mut ids = Vec::new();
+        for mut tree in trees {
+            let workspace = self.workspace(&tree.workspace_id)?;
+            if let Some(existing) = snapshot.worktrees.iter().find(|old| {
+                old.workspace_id == tree.workspace_id && old.directory == tree.directory
+            }) {
+                ensure!(
+                    existing.project_id == tree.project_id,
+                    "Checkout project changed; detach it before attaching another repository"
+                );
+                tree.id.clone_from(&existing.id);
+            }
+            self.db.execute("INSERT INTO worktrees(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![tree.id, serde_json::to_string(&tree)?])?;
+            if tree.directory == workspace.directory {
+                for mut session in snapshot
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        s.workspace_id == tree.workspace_id
+                            && s.worktree_id.is_none()
+                            && !matches!(s.backend, Backend::Remote { .. })
+                    })
+                    .cloned()
+                {
+                    session.worktree_id = Some(tree.id.clone());
+                    self.save_session(&session)?;
+                }
+            }
+            ids.push(tree.id);
+        }
+        transaction.commit()?;
+        Ok(ids)
+    }
+
+    /// Creates a new agent context in an explicitly selected checkout.
+    ///
+    /// # Errors
+    /// Returns missing-directory, invalid-backend, or database errors.
+    pub fn create_worktree_session(
+        &self,
+        worktree_id: &str,
+        name: &str,
+        backend: Backend,
+    ) -> Result<String> {
+        let tree = self.worktree(worktree_id)?;
+        ensure!(!tree.removed, "This checkout has been removed");
+        ensure!(
+            Path::new(&tree.directory).is_dir(),
+            "Checkout directory is missing"
+        );
+        ensure!(
+            !matches!(backend, Backend::Remote { .. }),
+            "Remote Plank chooses its directory on its own host"
+        );
+        let transaction = self.db.unchecked_transaction()?;
+        let id = self.create_session(&tree.workspace_id, name, backend)?;
+        let mut session = self.session(&id)?;
+        session.worktree_id = Some(tree.id);
+        self.save_session(&session)?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    /// Resolves the execution directory without falling back from a missing checkout.
+    ///
+    /// # Errors
+    /// Returns unknown identities, cross-workspace associations, or missing directories.
+    pub fn session_directory(&self, session: &Session) -> Result<String> {
+        let directory = if let Some(id) = &session.worktree_id {
+            let tree = self.worktree(id)?;
+            ensure!(!tree.removed, "This checkout has been removed");
+            ensure!(
+                tree.workspace_id == session.workspace_id,
+                "Checkout belongs to another workspace"
+            );
+            tree.directory
+        } else {
+            self.workspace(&session.workspace_id)?.directory
+        };
+        ensure!(
+            Path::new(&directory).is_dir(),
+            "Session checkout directory is missing: {directory}"
+        );
+        Ok(directory)
+    }
+
+    /// Requires all checkout sessions to be archived before filesystem removal.
+    ///
+    /// # Errors
+    /// Returns an error when any associated session is active or unarchived.
+    pub fn ensure_worktree_removable(&self, id: &str) -> Result<()> {
+        let tree = self.worktree(id)?;
+        ensure!(!tree.removed, "This checkout has already been removed");
+        let snapshot = self.snapshot(None, 0)?;
+        ensure!(
+            snapshot
+                .sessions
+                .iter()
+                .filter(|s| {
+                    let directory = if let Some(id) = &s.worktree_id {
+                        snapshot
+                            .worktrees
+                            .iter()
+                            .find(|t| &t.id == id)
+                            .map(|t| t.directory.as_str())
+                    } else if !matches!(s.backend, Backend::Remote { .. }) {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id == s.workspace_id)
+                            .map(|w| w.directory.as_str())
+                    } else {
+                        None
+                    };
+                    directory
+                        .is_some_and(|directory| Path::new(directory).starts_with(&tree.directory))
+                })
+                .all(|s| s.archived && !s.state.busy()),
+            "Stop and archive every session in this checkout before removing it"
+        );
+        Ok(())
+    }
+
+    /// Retires a removed checkout record; archived transcripts retain their association.
+    ///
+    /// # Errors
+    /// Returns active-session or database errors.
+    pub fn forget_worktree(&self, id: &str) -> Result<()> {
+        self.ensure_worktree_removable(id)?;
+        let directory = self.worktree(id)?.directory;
+        let transaction = self.db.unchecked_transaction()?;
+        for mut tree in self
+            .snapshot(None, 0)?
+            .worktrees
+            .into_iter()
+            .filter(|tree| tree.directory == directory)
+        {
+            tree.removed = true;
+            self.db.execute(
+                "UPDATE worktrees SET data=?2 WHERE id=?1",
+                params![tree.id, serde_json::to_string(&tree)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn save_session(&self, session: &Session) -> Result<()> {
@@ -402,6 +592,7 @@ impl Store {
         let mut session = self.session(id)?;
         ensure!(!session.state.busy(), "Stop the run before moving it");
         session.workspace_id = workspace_id.into();
+        session.worktree_id = None;
         self.save_session(&session)
     }
 
@@ -438,6 +629,9 @@ impl Store {
     pub fn archive(&self, id: &str, archived: bool) -> Result<()> {
         let mut session = self.session(id)?;
         ensure!(!session.state.busy(), "Stop the session before archiving");
+        if !archived {
+            self.session_directory(&session)?;
+        }
         session.archived = archived;
         self.save_session(&session)
     }
@@ -789,10 +983,25 @@ impl Store {
     /// # Errors
     /// Returns database or unknown-session errors.
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<()> {
+        self.append_with_kind(id, role, text, None)
+    }
+
+    /// Appends an entry with an optional structural kind (schema v4).
+    ///
+    /// # Errors
+    /// Returns session lookup or database errors.
+    pub fn append_with_kind(
+        &self,
+        id: &str,
+        role: &str,
+        text: &str,
+        kind: Option<&crate::model::EntryKind>,
+    ) -> Result<()> {
         self.session(id)?;
+        let kind = kind.map(serde_json::to_string).transpose()?;
         self.db.execute(
-            "INSERT INTO entries(session_id,role,text) VALUES(?1,?2,?3)",
-            params![id, role, text],
+            "INSERT INTO entries(session_id,role,text,kind) VALUES(?1,?2,?3,?4)",
+            params![id, role, text, kind],
         )?;
         Ok(())
     }
@@ -888,7 +1097,15 @@ impl Store {
     ///
     /// # Errors
     /// Returns database errors.
-    pub fn append_remote(&mut self, id: &str, sequence: i64, role: &str, text: &str) -> Result<()> {
+    pub fn append_remote(
+        &mut self,
+        id: &str,
+        sequence: i64,
+        role: &str,
+        text: &str,
+        kind: Option<&crate::model::EntryKind>,
+    ) -> Result<()> {
+        let kind = kind.map(serde_json::to_string).transpose()?;
         let tx = self.db.transaction()?;
         if tx.execute(
             "INSERT OR IGNORE INTO remote_seen VALUES(?1,?2)",
@@ -896,8 +1113,8 @@ impl Store {
         )? > 0
         {
             tx.execute(
-                "INSERT INTO entries(session_id,role,text) VALUES(?1,?2,?3)",
-                params![id, role, text],
+                "INSERT INTO entries(session_id,role,text,kind) VALUES(?1,?2,?3,?4)",
+                params![id, role, text, kind],
             )?;
         }
         tx.commit()?;
@@ -1024,6 +1241,12 @@ impl Store {
         aside_before: i64,
     ) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
+        let mut trees = self
+            .db
+            .prepare("SELECT data FROM worktrees ORDER BY rowid")?;
+        for row in trees.query_map([], |r| r.get::<_, String>(0))? {
+            snapshot.worktrees.push(serde_json::from_str(&row?)?);
+        }
         for (table, workspaces) in [("workspaces", true), ("sessions", false)] {
             let mut statement = self
                 .db
@@ -1041,18 +1264,20 @@ impl Store {
         if let Some(id) = session_id {
             for (side, cursor) in [(false, before), (true, aside_before)] {
                 let sql = if side {
-                    "SELECT sequence,session_id,role,text FROM entries WHERE session_id=?1 AND role IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2) ORDER BY sequence DESC LIMIT 250"
+                    "SELECT sequence,session_id,role,text,kind FROM entries WHERE session_id=?1 AND role IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2) ORDER BY sequence DESC LIMIT 250"
                 } else {
-                    "SELECT sequence,session_id,role,text FROM entries WHERE session_id=?1 AND role NOT IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2)
+                    "SELECT sequence,session_id,role,text,kind FROM entries WHERE session_id=?1 AND role NOT IN ('aside','aside_thinking','aside_tool','aside_notice','aside_error') AND (?2=0 OR sequence<?2)
                  ORDER BY sequence DESC LIMIT 250"
                 };
                 let mut statement = self.db.prepare(sql)?;
                 let rows = statement.query_map(params![id, cursor], |r| {
+                    let kind: Option<String> = r.get(4)?;
                     Ok(Entry {
                         sequence: r.get(0)?,
                         session_id: r.get(1)?,
                         role: r.get(2)?,
                         text: r.get(3)?,
+                        kind: kind.and_then(|raw| serde_json::from_str(&raw).ok()),
                     })
                 })?;
                 for row in rows {
@@ -1184,10 +1409,10 @@ impl Store {
     /// Returns an error if a future schema is encountered.
     pub fn check_version(&self) -> Result<()> {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 3 {
+        if version > 5 {
             bail!("Database was created by a newer nplank version");
         }
-        self.db.pragma_update(None, "user_version", 3)?;
+        self.db.pragma_update(None, "user_version", 5)?;
         Ok(())
     }
 }

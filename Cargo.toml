@@ -12,10 +12,11 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["gui"]
 test-engine = []
-gui = ["dep:sysinfo", "dep:gpui", "dep:gpui-miniapp", "dep:gpui-ui-kit", "dep:gpui-ui-kit-macros", "dep:gpui-design", "dep:image", "dep:notify-rust", "dep:unicode-segmentation"]
+gui = ["dep:sysinfo", "dep:gpui", "dep:gpui-keybinding", "dep:gpui-miniapp", "dep:gpui-ui-kit", "dep:gpui-ui-kit-macros", "dep:gpui-design", "dep:image", "dep:notify-rust", "dep:unicode-segmentation", "dep:d3rs"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 futures-util = "0.3"
 unicode-segmentation = { version = "1.13", optional = true }
@@ -26,8 +27,10 @@ uuid = { version = "1", features = ["v4", "v7"] }
 gpui = { package = "sotf-gpui-toolkit-gpui", git = "https://github.com/pierreaubert/sotf-3rdparties", branch = "foreign-parent-win-linux", version = "0.2.3", default-features = false, optional = true }
 gpui-miniapp = { path = "../gpui-toolkit/crates/gpui-miniapp", default-features = false, optional = true }
 gpui-ui-kit = { path = "../gpui-toolkit/crates/gpui-ui-kit", default-features = false, optional = true }
+d3rs = { package = "gpui-d3rs", path = "../gpui-toolkit/crates/gpui-d3rs", default-features = false, features = ["gpui"], optional = true }
 gpui-ui-kit-macros = { path = "../gpui-toolkit/crates/gpui-ui-kit-macros", optional = true }
 gpui-design = { path = "../gpui-toolkit/crates/gpui-design", features = ["gpui"], optional = true }
+gpui-keybinding = { path = "../gpui-toolkit/crates/gpui-keybinding", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 axum = "0.8"
@@ -42,12 +45,18 @@ tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sysinfo = { version = "0.36", default-features = false, features = ["system"], optional = true }
+nplank-macos-shim = { path = "crates/macos-shim" }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSDockTile", "objc2-core-foundation"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "objc2-core-foundation", "std"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 gpui-ios = { path = "../gpui-toolkit/crates/gpui-ios" }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
 notify-rust = { version = "4.18.0", optional = true }
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
@@ -60,6 +69,7 @@ web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "Docum
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+gpui = { package = "sotf-gpui-toolkit-gpui", git = "https://github.com/pierreaubert/sotf-3rdparties", branch = "foreign-parent-win-linux", version = "0.2.3", default-features = false, features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "forbid"

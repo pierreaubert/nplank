@@ -170,11 +170,24 @@ pub(crate) async fn run(
         if let Some(model) = model.as_ref().filter(|m| !m.trim().is_empty()) {
             command.extend(["--model".into(), model.clone()]);
         }
+        // Image delivery per CLI: Codex takes --image files (materialized
+        // on this host); Claude takes base64 blocks via stream-json input.
+        let image_files = if *provider == AgentProvider::Codex && !prompt.images.is_empty() {
+            crate::workers::materialize_images(directory, &prompt.images)?
+        } else {
+            Vec::new()
+        };
+        if *provider == AgentProvider::ClaudeCode && !prompt.images.is_empty() {
+            command.extend(["--input-format".into(), "stream-json".into()]);
+        }
         if *provider == AgentProvider::Codex {
             if identity.is_some() {
                 command.push("resume".into());
             }
             command.extend(["--json".into(), "--skip-git-repo-check".into()]);
+            for file in &image_files {
+                command.extend(["--image".into(), file.display().to_string()]);
+            }
         }
         if let Some(identity) = identity {
             if *provider == AgentProvider::ClaudeCode {
@@ -188,7 +201,26 @@ pub(crate) async fn run(
         let mut child = process(executable, &command, directory)?;
         let _process = crate::metadata::ProcessLease::new(&daemon, session, child.id());
         let mut stdin = child.stdin.take().context("Agent stdin unavailable")?;
-        stdin.write_all(prompt.as_bytes()).await?;
+        if *provider == AgentProvider::ClaudeCode && !prompt.images.is_empty() {
+            let mut content = vec![serde_json::json!({"type":"text","text":prompt.text})];
+            for image in &prompt.images {
+                content.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    },
+                }));
+            }
+            let message = serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            });
+            stdin.write_all(format!("{message}\n").as_bytes()).await?;
+        } else {
+            stdin.write_all(prompt.text.as_bytes()).await?;
+        }
         stdin.shutdown().await?;
         drop(stdin);
         state(&daemon, session, RunState::Running)?;
@@ -562,7 +594,14 @@ async fn muse(
             command = input.recv() => match command {
                 Some(Input::Prompt(prompt)) => {
                     host.streamed.clear(); host.kinds.clear();
-                    host.request("turn/start", json!({"commandId":uuid::Uuid::now_v7().to_string(), "sessionId":identity, "ifBusy":"queue", "input":[{"type":"text", "text":prompt}]})).await?;
+                    // Muse has no documented image input item; materialize
+                    // and reference the files in text like plank does.
+                    let text = crate::workers::with_image_references(
+                        prompt.text,
+                        &crate::workers::materialize_images(directory, &prompt.images)?,
+                        &prompt.images,
+                    );
+                    host.request("turn/start", json!({"commandId":uuid::Uuid::now_v7().to_string(), "sessionId":identity, "ifBusy":"queue", "input":[{"type":"text", "text":text}]})).await?;
                     state(&daemon, session, RunState::Running)?;
                 }
                 Some(Input::Approval { approval, choice }) => {

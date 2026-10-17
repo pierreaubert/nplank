@@ -28,6 +28,9 @@ struct Args {
     /// Retain temporary QA files after closing the window.
     #[arg(long)]
     keep_data: bool,
+    /// Start with the static native question layout instead of the Plank controls tab.
+    #[arg(long)]
+    questions: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,41 @@ impl Fixture {
             workspace.join("large-editor.rs"),
             "// 🦀 Large editor verification fixture\n".repeat(4096),
         )?;
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "example.rs"],
+            vec![
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@example.invalid",
+                "commit",
+                "-m",
+                "QA fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workspace)
+                .args(args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "QA Git setup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["worktree", "add", "-b", "feature/quiet-ui"])
+            .arg(root.join("linked-checkout"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "QA worktree setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let store = Store::open(&state.join("state.sqlite"))?;
         let workspace_id =
             store.create_workspace("UI verification", &workspace.to_string_lossy())?;
@@ -86,6 +124,20 @@ impl Fixture {
         store.reset(&sample)?;
         store.append(&sample, "user", "Fixture: current context")?;
         store.append(&sample, "assistant", "Expand Earlier context, inspect Older messages when available, and return to the Plank tab to exercise /command and the controls.")?;
+        for multi in [false, true] {
+            store.approval(&sample, store.session(&sample)?.generation, nplank::model::PendingApproval {
+                id: format!("qa-question-{multi}"),
+                requirement: serde_json::json!({"kind":"plank_question", "revision": format!("qa-{multi}"), "request": {"multi":multi}}),
+                tool: if multi { "Choose checks" } else { "Choose an approach" }.into(),
+                arguments: "**Layout fixture:** select options and verify explicit confirmation. This static fixture has no engine waiting for an answer.".into(),
+                document: None,
+                choices: vec![
+                    nplank::model::ApprovalChoice { id:"1".into(), label:"Keep the conversation in focus and open project navigation only when it is needed, with enough room for a long description on small screens.".into() },
+                    nplank::model::ApprovalChoice { id:"2".into(), label:"Pin project navigation beside the conversation while reviewing several worktrees.".into() },
+                    nplank::model::ApprovalChoice { id:"0".into(), label:"Decline".into() },
+                ],
+            })?;
+        }
         Ok(Self {
             root: root.into(),
             home,
@@ -157,6 +209,28 @@ async fn run_ui(fixture: &Fixture) -> Result<()> {
         app.is_file() && daemon.is_file(),
         "Build nplank and nplankd before launching QA"
     );
+    // A distinct bundle lets accessibility tools select this disposable process
+    // without launching the user's installed NPlank application by name.
+    #[cfg(target_os = "macos")]
+    let app = {
+        let contents = fixture.root.join("NPlank QA.app/Contents");
+        let executable = contents.join("MacOS/nplank-qa");
+        std::fs::create_dir_all(contents.join("MacOS"))?;
+        std::fs::copy(&app, &executable)?;
+        std::fs::write(
+            contents.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>nplank-qa</string>
+<key>CFBundleIdentifier</key><string>org.spinorama.nplank.qa</string>
+<key>CFBundleName</key><string>NPlank QA</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSPrincipalClass</key><string>NSApplication</string>
+</dict></plist>"#,
+        )?;
+        executable
+    };
     let address = TcpListener::bind("127.0.0.1:0")
         .context("QA needs a loopback listener; run just qa-ui outside the execution sandbox")?
         .local_addr()?;
@@ -248,6 +322,19 @@ async fn main() -> Result<()> {
     let engine = std::fs::canonicalize(engine)?;
     let directory = tempfile::Builder::new().prefix("nplank-ui-qa-").tempdir()?;
     let fixture = Fixture::prepare(directory.path(), &engine)?;
+    if args.questions {
+        let store = Store::open(&fixture.state.join("state.sqlite"))?;
+        let sample = store
+            .snapshot(None, 0)?
+            .sessions
+            .into_iter()
+            .find(|session| matches!(session.backend, Backend::Demo))
+            .context("Question fixture missing")?;
+        std::fs::write(
+            fixture.state.join("preferences.json"),
+            serde_json::to_vec(&serde_json::json!({"theme":0,"design":0,"selected":sample.id}))?,
+        )?;
+    }
     println!("QA files: {}", fixture.root.display());
     let result = async {
         let count = fixture.probe_engine().await?;

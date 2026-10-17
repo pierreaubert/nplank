@@ -1,0 +1,16 @@
+[package]
+name = "nplank-macos-shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "macOS-only Objective-C surface for nplank (status item, user notifications). The only crate in the workspace allowed unsafe code."
+
+[dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSResponder", "NSView", "NSStatusBarButton", "objc2-core-foundation"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "NSDictionary", "NSObject", "NSRunLoop", "objc2-core-foundation", "std"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
+block2 = "0.6"
+
+[lints.rust]
+unsafe_code = "allow"

@@ -35,7 +35,7 @@ The app starts `nplankd` automatically and reconnects on subsequent launches.
 State defaults to this checkout's `.nplank/`; override it with `--data-dir` or
 `NPLANK_DATA_DIR`. Closing the window leaves the daemon and its runs alive.
 If an older daemon is already running, finish its runs and restart it with the
-updated binary. The current client/daemon protocol is version 44; startup reports
+updated binary. The current client/daemon protocol is version 45; startup reports
 an incompatible daemon rather than replacing a live service.
 
 On macOS, File → New Workspace (Cmd-Shift-N) creates a workspace; File → New
@@ -51,6 +51,67 @@ archive/restore, and moving stopped sessions between workspaces. Moving starts
 a fresh engine context and preserves the transcript. Drafts, selected tabs,
 and collapsed groups survive relaunch.
 Archiving requires a stopped agent and preserves its transcript.
+
+Navigation automatically collapses below 1,600 logical pixels or when a wider navigator
+would crowd the conversation.
+The remaining rail is green when no action is needed, yellow for a pending choice,
+red for a failure/recovery requirement, and neutral when disconnected. Running agents
+alone do not make it yellow. Cmd/Ctrl-B opens navigation; Escape dismisses the overlay.
+The navigator offers saved Auto, Pinned, and Hidden modes.
+
+The top bar has an explicit **+ New session** action and Fleet / CI / Monitor / Docs
+buttons, which collapse to icons in narrow windows. Workspace and machine session
+rows offer × to stop the agent while preserving its transcript.
+
+The composer grows with multiline text, up to a scrollable limit. Enter sends;
+Shift-Enter inserts a newline. Type `/` for command completion, use arrows to select,
+and Tab or Enter to prepare the command. Attach, stop, and fresh-context actions
+sit above the input as icons.
+
+Session-header split icons open independent panes to the right or below. The default
+shortcuts are Cmd/Ctrl-Alt-V, Cmd/Ctrl-Alt-H, and Cmd/Ctrl-Alt-W to close a pane.
+Each pane can select its own session, terminal, or overview. Closing a pane preserves
+agent sessions. Splits currently use equal proportions and last for the window's
+lifetime; resizing dividers and restoring layouts are not implemented.
+
+Cmd/Ctrl-Shift-P opens the application command palette. **Keyboard shortcuts** in
+that palette offers toolkit Default, Vim, Emacs, and VS Code presets, editable
+bindings, conflict validation, and reset. Vim/Emacs navigation is scoped to navigator
+focus; typing in the composer remains text entry. Cmd/Ctrl-L focuses the composer;
+Cmd/Ctrl-Shift-L focuses the transcript; Cmd/Ctrl-Shift-U focuses the first pending question. Optional meters and counters are available
+through **Toggle diagnostics** and are hidden by default.
+
+Agent questions use native radio or checkbox controls. Selecting an option does not
+submit it: use **Confirm answer**. Multi-select decline is exclusive, and answers are
+scoped to the exact request revision. A changed question starts with no selection.
+Questions do not take keyboard focus when they arrive.
+
+Conversations render native Markdown emphasis, inline code, safe web/mail links,
+ordered lists, and tables. Focus a linked paragraph with Tab, choose its links with
+the arrow keys, and press Enter to open one. Tool output is folded by default while
+failures stay visible; message widths are bounded for readability.
+
+Git workspaces discover linked checkouts automatically at creation and daemon startup.
+Each workspace's **Projects & worktrees…** opens checkout management. Enter a repository
+path on the daemon host and choose **Discover / attach project** to list its linked
+checkouts. **New worktree from here** creates a new branch from a specified base in an
+absolute destination directory. **New agent** binds a fresh session to that checkout.
+Related sessions appear under their project and branch, with session tabs within a
+checkout. **Inspect changes** shows file status and separate staged/unstaged diffs from
+the daemon host. **Open local terminal** opens a shell after verifying the checkout on
+this computer, including checkouts with no agent tabs. Drafts and transcript scroll
+positions remain independent when switching.
+Workspaces rooted in a repository subfolder group under the containing checkout,
+while existing sessions retain their original subfolder working directory.
+**Close session tab** in the command palette hides a tab without stopping its agent;
+**Reopen closed tabs** restores hidden tabs. Hidden agents still contribute to the
+status rail.
+
+Removing a checkout requires all its sessions, including sessions in other workspaces,
+to be stopped and archived. Dirty, locked, and main checkouts cannot be removed through
+the app. Removal keeps branches, commits, and archived transcripts; it is distinct from
+archiving a session or hiding a workspace. A removed or missing checkout never redirects
+agent execution to another directory. Existing non-Git workspaces remain supported.
 
 ## Agent providers
 
@@ -158,8 +219,7 @@ Do not include `--ui` or `--prompt` in the engine arguments.
 
 Rebuild the bundled engine with `just build-plank` to use slash commands and
 structured questions and editors; older installed Plank binaries lack these console changes.
-Use the resulting executable's absolute path in the agent popup. Type `/`, use
-the composer's `/` button, or press Cmd-Shift-P to discover controls. Selecting
+Use the resulting executable's absolute path in the agent popup. Type `/` in the composer, or press Cmd-Shift-P to discover controls. Selecting
 a command prepares the composer for explicit submission. Plank questions and
 yes/no confirmations appear as compact answer controls, including multiple
 selections and decline. The picker loads installed extension commands from the
@@ -184,8 +244,8 @@ Activity → Model → Downloads shows live model-update progress and the last
 result. Download/resume and cancellation controls prepare commands for explicit
 Send; cancellation can keep or delete partial files. Verified artifacts are
 preserved. Rebuild Plank to receive these snapshots. The client/daemon protocol
-is version 44; finish active runs before restarting an older daemon. Database
-schema 3 migrates inline editor originals into separate chunk storage atomically.
+is version 45; finish active runs before restarting an older daemon. Database
+schema 5 adds durable worktree identities, preserving existing sessions and editor storage.
 
 Activity → Agents shows delegated tasks, running/finished state, elapsed time,
 and completed-pass input/output tokens. Report expands a bounded Markdown result

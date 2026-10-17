@@ -11,12 +11,18 @@ mod browser_preferences;
 mod buddy_view;
 #[path = "../plank/src/buddyframe.rs"]
 pub mod buddyframe;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod ci;
 pub mod client;
 pub mod commands;
 #[cfg(not(target_family = "wasm"))]
 pub mod daemon;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod dashboards;
 #[path = "../plank/src/documenttransfer.rs"]
 pub mod documenttransfer;
+#[cfg(any(feature = "gui", test))]
+mod fleet;
 #[cfg(not(target_family = "wasm"))]
 mod focus;
 #[path = "../plank/src/guiframe.rs"]
@@ -29,22 +35,42 @@ pub mod insightchart;
 pub mod joboutput;
 #[path = "../plank/src/livecontrol.rs"]
 pub mod livecontrol;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod machines;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod markdown;
 #[cfg(not(target_family = "wasm"))]
 mod metadata;
 pub mod model;
+#[cfg(any(feature = "gui", test))]
+mod navigation;
 pub mod notifications;
 #[cfg(any(test, all(feature = "gui", target_family = "wasm")))]
 mod preference_queue;
 #[cfg(any(feature = "gui", test))]
+mod preflight;
+#[cfg(any(feature = "gui", test))]
 mod preview;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod prom;
+#[cfg(any(feature = "gui", test))]
+mod questions;
+#[cfg(feature = "gui")]
+mod shortcuts;
 #[cfg(not(target_family = "wasm"))]
 pub mod store;
 #[path = "../plank/src/subhistory.rs"]
 pub mod subhistory;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod tools;
+#[cfg(any(feature = "gui", test))]
+pub(crate) mod usage;
 #[cfg(not(target_family = "wasm"))]
 mod web_host;
 #[cfg(not(target_family = "wasm"))]
 mod workers;
+#[cfg(not(target_family = "wasm"))]
+mod worktrees;
 
 #[cfg(feature = "gui")]
 mod document;
@@ -59,6 +85,13 @@ mod transcript;
 #[cfg(feature = "gui")]
 pub mod ui;
 
+#[cfg(all(feature = "gui", target_os = "macos"))]
+mod dock;
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod terminal;
 #[cfg(all(feature = "gui", target_os = "macos"))]
 mod utilization;
 

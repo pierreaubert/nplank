@@ -189,7 +189,7 @@ fn inline_editor_migration_is_atomic_and_preserves_the_revision_and_original_byt
         let snapshot: Snapshot = migrated.snapshot(Some(&id), 0)?;
         assert!(snapshot.sessions[0].approvals[0].arguments.is_empty());
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
     }
     Ok(())
 }

@@ -63,6 +63,7 @@ async fn graphical_frames_route_input_fence_ownership_and_retire_after_close_or_
         session_id: session.clone(),
         request_id: "open-frame".into(),
         text: "/frame demo".into(),
+        images: Vec::new(),
     })?;
     let (generation, initial) = wait_frame(&daemon, &session, |_| true).await?;
     let command = |owner, frame: &str, input| Command::FrameControl {
@@ -152,6 +153,7 @@ async fn graphical_frames_route_input_fence_ownership_and_retire_after_close_or_
         session_id: session.clone(),
         request_id: "reopen-frame".into(),
         text: "/frame demo".into(),
+        images: Vec::new(),
     })?;
     let (_, replacement) = wait_frame(&daemon, &session, |frame| frame.id != initial.id).await?;
     assert!(

@@ -21,6 +21,8 @@ impl gpui::AssetSource for Assets {
         Ok(match path {
             "icons/cpu.svg" => Some(Cow::Borrowed(include_bytes!("../assets/cpu.svg"))),
             "icons/gpu.svg" => Some(Cow::Borrowed(include_bytes!("../assets/gpu.svg"))),
+            "icons/chatgpt.svg" => Some(Cow::Borrowed(include_bytes!("../assets/chatgpt.svg"))),
+            "icons/muse.svg" => Some(Cow::Borrowed(include_bytes!("../assets/muse.svg"))),
             _ => None,
         })
     }

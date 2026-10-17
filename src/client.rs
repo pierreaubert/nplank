@@ -138,6 +138,31 @@ impl Client {
         Ok(response.json().await?)
     }
 
+    /// Fetches a registered checkout's status and diffs from the daemon.
+    ///
+    /// # Errors
+    /// Returns connection, authentication, or checkout inspection errors.
+    pub async fn worktree_changes(&self, id: &str) -> Result<crate::model::WorktreeChanges> {
+        let response = self
+            .http
+            .get(format!("{}/v1/worktree-changes", self.url))
+            .timeout(Duration::from_secs(160))
+            .bearer_auth(&self.token)
+            .query(&[("id", id)])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let body: serde_json::Value = response.json().await?;
+            anyhow::bail!(
+                "{}",
+                body["error"]
+                    .as_str()
+                    .unwrap_or("Checkout inspection failed")
+            );
+        }
+        Ok(response.json().await?)
+    }
+
     /// Fetches bounded chunks and validates an original document before publishing it.
     ///
     /// # Errors

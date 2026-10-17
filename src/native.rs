@@ -2,7 +2,8 @@
 
 // Rust guideline compliant 2026-02-21
 use crate::ui::{
-    NewAgent, NewWorkspace, OpenCommands, OpenPreferences, SelectAppearance, ToggleArchived,
+    NewAgent, NewWorkspace, NextAttention, OpenCommands, OpenPreferences, PairDevice, PasteImage,
+    SelectAppearance, ToggleArchived, ToggleCi, ToggleDocs, ToggleFleet, ToggleMonitor,
     WorkspaceView,
 };
 use gpui::*;
@@ -20,6 +21,8 @@ impl AssetSource for Assets {
         Ok(match path {
             "icons/cpu.svg" => Some(Cow::Borrowed(include_bytes!("../assets/cpu.svg"))),
             "icons/gpu.svg" => Some(Cow::Borrowed(include_bytes!("../assets/gpu.svg"))),
+            "icons/chatgpt.svg" => Some(Cow::Borrowed(include_bytes!("../assets/chatgpt.svg"))),
+            "icons/muse.svg" => Some(Cow::Borrowed(include_bytes!("../assets/muse.svg"))),
             _ => None,
         })
     }
@@ -106,6 +109,31 @@ pub fn run(
             cx.on_action(move |_: &ToggleArchived, cx| {
                 let _ = window.update(cx, |view, _, cx| view.toggle_archived(cx));
             });
+            cx.on_action(move |_: &ToggleFleet, cx| {
+                let _ = window.update(cx, |view, _, cx| view.toggle_fleet(cx));
+            });
+            cx.on_action(move |_: &ToggleCi, cx| {
+                let _ = window.update(cx, |view, _, cx| view.toggle_ci(cx));
+            });
+            cx.on_action(move |_: &ToggleDocs, cx| {
+                let _ = window.update(cx, |view, _, cx| view.toggle_docs(cx));
+            });
+            cx.on_action(move |_: &ToggleMonitor, cx| {
+                let _ = window.update(cx, |view, _, cx| view.toggle_monitor(cx));
+            });
+            cx.on_action(move |_: &NextAttention, cx| {
+                let _ = window.update(cx, |view, _, cx| view.go_next_attention(cx));
+            });
+            cx.on_action(move |_: &PasteImage, cx| {
+                let _ = window.update(cx, |view, _, cx| {
+                    if view.paste_clipboard_image(cx) {
+                        cx.notify();
+                    }
+                });
+            });
+            cx.on_action(move |_: &PairDevice, cx| {
+                let _ = window.update(cx, |view, _, cx| view.pair_device(cx));
+            });
             cx.on_action(move |_: &OpenCommands, cx| {
                 let _ = window.update(cx, |view, _, cx| view.open_commands(cx));
             });
@@ -139,10 +167,6 @@ pub fn run(
             edit_handler!(Undo, "cmd-z");
             edit_handler!(Redo, "cmd-shift-z");
             cx.bind_keys([
-                KeyBinding::new("cmd-n", NewAgent, None),
-                KeyBinding::new("cmd-shift-n", NewWorkspace, None),
-                KeyBinding::new("cmd-,", OpenPreferences, None),
-                KeyBinding::new("cmd-shift-p", OpenCommands, None),
                 KeyBinding::new("cmd-w", CloseWindow, None),
                 KeyBinding::new("cmd-m", Minimize, None),
             ]);
@@ -176,6 +200,10 @@ pub fn run(
             })
             .detach();
             cx.activate(true);
+            nplank_macos_shim::install_status_item();
+            if nplank_macos_shim::inside_app_bundle() {
+                nplank_macos_shim::install_notification_delegate();
+            }
         });
     Ok(())
 }
@@ -227,6 +255,7 @@ fn menus() -> Vec<Menu> {
             "nplank",
             vec![
                 MenuItem::action("Preferences…", OpenPreferences),
+                MenuItem::action("Pair iOS Device…", PairDevice),
                 MenuItem::Separator,
                 MenuItem::action("Quit nplank", Quit),
             ],
@@ -256,6 +285,11 @@ fn menus() -> Vec<Menu> {
             "View",
             vec![
                 MenuItem::action("Plank Commands…", OpenCommands),
+                MenuItem::action("Fleet Overview", ToggleFleet),
+                MenuItem::action("CI Runs", ToggleCi),
+                MenuItem::action("Markdown Docs", ToggleDocs),
+                MenuItem::action("Monitoring", ToggleMonitor),
+                MenuItem::action("Next Needs Attention", NextAttention),
                 MenuItem::Submenu(menu("Theme", themes)),
                 MenuItem::Submenu(menu("Design", designs)),
                 MenuItem::Separator,

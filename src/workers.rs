@@ -16,11 +16,111 @@ use crate::{
     model::{Backend, RunState, Session},
 };
 
+/// A user prompt plus any images delivered with it.
+#[derive(Debug, Default)]
+pub(crate) struct PromptInput {
+    pub text: String,
+    pub images: Vec<crate::model::PromptImage>,
+}
+
+impl From<String> for PromptInput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for PromptInput {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+/// Decodes prompt images into `<directory>/.nplank-images/` (content-named)
+/// and returns their paths. The plank engine is text-oriented: models open
+/// the files with their image tools, mirroring plank's own paste pipeline.
+pub(crate) fn materialize_images(
+    directory: &str,
+    images: &[crate::model::PromptImage],
+) -> Result<Vec<std::path::PathBuf>> {
+    use base64::Engine as _;
+    use std::hash::Hasher as _;
+    let mut paths = Vec::new();
+    if images.is_empty() {
+        return Ok(paths);
+    }
+    let dir = std::path::Path::new(directory).join(".nplank-images");
+    std::fs::create_dir_all(&dir).context("Could not create image attachment directory")?;
+    for image in images {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image.data.trim())
+            .with_context(|| format!("Attached image {} is not valid base64", image.name))?;
+        let ext = match image.media_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "img",
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write(&mut hasher, &bytes);
+        let path = dir.join(format!("img-{:016x}.{ext}", hasher.finish()));
+        if !path.exists() {
+            std::fs::write(&path, &bytes)
+                .with_context(|| format!("Could not write attached image {}", image.name))?;
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Prompt text for remote hosts, which cannot receive image bytes yet.
+pub(crate) fn remote_prompt_text(prompt: PromptInput) -> String {
+    if prompt.images.is_empty() {
+        return prompt.text;
+    }
+    let names = prompt
+        .images
+        .iter()
+        .map(|image| image.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}\n\n[{} image(s) attached in the client were not transferred to this remote host: {}]",
+        prompt.text,
+        prompt.images.len(),
+        names
+    )
+}
+
+/// Appends `[Image #n] path (media)` references to prompt text.
+pub(crate) fn with_image_references(
+    mut text: String,
+    paths: &[std::path::PathBuf],
+    images: &[crate::model::PromptImage],
+) -> String {
+    if paths.is_empty() {
+        return text;
+    }
+    text.push_str("\n\nAttached images:\n");
+    for (index, (path, image)) in paths.iter().zip(images).enumerate() {
+        text.push_str(&format!(
+            "- [Image #{}] {} ({})\n",
+            index + 1,
+            path.display(),
+            image.media_type
+        ));
+    }
+    text
+}
+
 #[derive(Debug)]
 pub(crate) enum Input {
     Observe,
     RemoteControl(bool),
-    Prompt(String),
+    Prompt(PromptInput),
     Aside(String),
     LiveControl(crate::livecontrol::LiveControl),
     FrameControl(crate::frame::Request),
@@ -47,9 +147,14 @@ pub(crate) async fn run(
         Backend::Demo => {
             while let Some(Input::Prompt(prompt)) = input.recv().await {
                 state(&daemon, session, RunState::Running)?;
+                let note = if prompt.images.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{} image(s) attached]", prompt.images.len())
+                };
                 let answer = format!(
-                    "Demo session: {}\n\nYou wrote: {prompt}\n\nThis Rust worker runs in the daemon. Closing the window leaves it running. Select Local Plank to use a real engine.",
-                    session.name
+                    "Demo session: {}\n\nYou wrote: {}{note}\n\nThis Rust worker runs in the daemon. Closing the window leaves it running. Select Local Plank to use a real engine.",
+                    session.name, prompt.text
                 );
                 for word in answer.split_inclusive(' ') {
                     append(&daemon, session, "assistant", word)?;
@@ -65,7 +170,7 @@ pub(crate) async fn run(
         Backend::Agent { .. } => crate::agents::run(daemon, session, directory, input).await,
         Backend::Remote { url, token_env } => {
             let initial = match input.recv().await {
-                Some(Input::Prompt(prompt)) => Some(prompt),
+                Some(Input::Prompt(prompt)) => Some(remote_prompt_text(prompt)),
                 Some(Input::Observe) => None,
                 _ => return Ok(()),
             };
@@ -240,6 +345,11 @@ async fn local(
                         writes.json(&frame)?;
                     }
                     Some(Input::Prompt(prompt)) if ready => {
+                        let prompt = with_image_references(
+                            prompt.text,
+                            &materialize_images(directory, &prompt.images)?,
+                            &prompt.images,
+                        );
                         quit_requested = matches!(prompt.trim(), "/quit" | "/exit");
                         writes.prompt(&prompt, typed_prompts)?;
                         running = true;
@@ -248,7 +358,11 @@ async fn local(
                     }
                     Some(Input::Prompt(prompt)) if question && !running => {
                         ensure!(deferred_prompt.is_none(), "Multiple startup prompts were queued");
-                        deferred_prompt = Some(prompt);
+                        deferred_prompt = Some(with_image_references(
+                            prompt.text,
+                            &materialize_images(directory, &prompt.images)?,
+                            &prompt.images,
+                        ));
                     }
                     Some(Input::Approval { approval, choice }) if question && approval.id == question_id => {
                         let current = daemon.store.lock().expect("store poisoned").session(&session.id)?;
@@ -993,6 +1107,7 @@ async fn remote_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
                     "Remote is restarting; queued input was not sent. Inspect the host before retrying");
                 match command {
                     Some(Input::Prompt(prompt)) => {
+                        let prompt = remote_prompt_text(prompt);
                         ensure!(active.is_none() && pending.is_none(), "Remote already has an active or queued input");
                         if !remote_generation_current(&daemon, session)? {
                             socket.close(None).await?;
@@ -1784,10 +1899,19 @@ fn ingest_remote(daemon: &Daemon, session: &Session, value: &serde_json::Value) 
         if store.session(&session.id)?.generation != session.generation {
             return Ok(());
         }
+        // Tool invocations carry structure the transcript can render as a
+        // block instead of raw text; everything else stays plain.
+        let kind = match value["type"].as_str().unwrap_or("") {
+            "tool" => Some(crate::model::EntryKind::ToolCall {
+                name: value["name"].as_str().unwrap_or_default().to_owned(),
+                target: value["target"].as_str().unwrap_or_default().to_owned(),
+            }),
+            _ => None,
+        };
         if let Some(sequence) = value["id"].as_i64() {
-            store.append_remote(&session.id, sequence, role, text)?;
+            store.append_remote(&session.id, sequence, role, text, kind.as_ref())?;
         } else {
-            store.append(&session.id, role, text)?;
+            store.append_with_kind(&session.id, role, text, kind.as_ref())?;
         }
     }
     Ok(())
@@ -1880,12 +2004,19 @@ fn ingest_telemetry(daemon: &Daemon, session: &Session, value: &serde_json::Valu
         };
         let text = value["text"].as_str().context("Aside text is missing")?;
         ensure!(text.len() <= 256 * 1024, "Aside frame is too large");
+        let kind = match value["role"].as_str() {
+            Some("tool") => Some(crate::model::EntryKind::ToolCall {
+                name: value["name"].as_str().unwrap_or_default().to_owned(),
+                target: value["target"].as_str().unwrap_or_default().to_owned(),
+            }),
+            _ => None,
+        };
         let mut store = daemon.store.lock().expect("store poisoned");
         if store.session(&session.id)?.generation == session.generation {
             if let Some(sequence) = value["id"].as_i64() {
-                store.append_remote(&session.id, sequence, role, text)?;
+                store.append_remote(&session.id, sequence, role, text, kind.as_ref())?;
             } else {
-                store.append(&session.id, role, text)?;
+                store.append_with_kind(&session.id, role, text, kind.as_ref())?;
             }
         }
         return Ok(());
@@ -2221,6 +2352,40 @@ mod tests {
     use super::decode_utf8;
 
     #[test]
+    fn prompt_images_materialize_and_reference() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir()?;
+        let image = crate::model::PromptImage {
+            name: "shot.png".into(),
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake"),
+        };
+        let paths =
+            super::materialize_images(dir.path().to_str().unwrap(), std::slice::from_ref(&image))?;
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].extension().and_then(|e| e.to_str()), Some("png"));
+        assert_eq!(std::fs::read(&paths[0])?, b"\x89PNG-fake");
+        // Content-named: materializing twice yields the same single file.
+        let again =
+            super::materialize_images(dir.path().to_str().unwrap(), std::slice::from_ref(&image))?;
+        assert_eq!(paths, again);
+        let text = super::with_image_references("look".into(), &paths, &[image]);
+        assert!(text.contains("[Image #1]"));
+        assert!(text.contains("(image/png)"));
+        let remote = super::remote_prompt_text(super::PromptInput {
+            text: "look".into(),
+            images: vec![crate::model::PromptImage {
+                name: "shot.png".into(),
+                media_type: "image/png".into(),
+                data: String::new(),
+            }],
+        });
+        assert!(remote.contains("not transferred"));
+        assert!(remote.contains("shot.png"));
+        Ok(())
+    }
+
+    #[test]
     fn editor_opening_streams_publish_only_complete_verified_documents() -> anyhow::Result<()> {
         let text = "\u{0}🦀\\\r\n".repeat(20_000);
         let title = "\u{0}".repeat(4096);
@@ -2501,7 +2666,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (daemon, session, _directory) = remote_restart_fixture()?;
             super::bind_remote_instance(&daemon, &session, &serde_json::json!({"instance_id":"old-instance"}))?;
-            daemon.store.lock().unwrap().append_remote(&session.id, 1, "assistant", "Keep old replay identity")?;
+            daemon.store.lock().unwrap().append_remote(&session.id, 1, "assistant", "Keep old replay identity", None)?;
             let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
             let server = tokio::spawn(async move {
                 let mut socket = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
@@ -2515,7 +2680,7 @@ mod tests {
             let socket = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
             assert_eq!(super::remote_connection(std::sync::Arc::clone(&daemon), &session, socket, "fixture", None, &mut rx, Some("old-instance")).await?, super::RemoteExit::AwaitReplacement);
             server.await??;
-            daemon.store.lock().unwrap().append_remote(&session.id, 1, "assistant", "Must stay deduplicated")?;
+            daemon.store.lock().unwrap().append_remote(&session.id, 1, "assistant", "Must stay deduplicated", None)?;
             let snapshot = daemon.snapshot(Some(&session.id), 0)?;
             assert_eq!(snapshot.entries.iter().filter(|entry| entry.role == "assistant").map(|entry| entry.text.as_str()).collect::<Vec<_>>(), ["Keep old replay identity"]);
             Ok::<_, anyhow::Error>(())
@@ -3240,6 +3405,7 @@ mod tests {
             1,
             "assistant",
             "Original replay",
+            None,
         )?;
         let (client_stream, server_stream) = tokio::io::duplex(4096);
         let server = tokio::spawn(async move {
@@ -3275,7 +3441,7 @@ mod tests {
         server.await??;
         let mut store = daemon.store.lock().unwrap();
         assert!(!store.bind_remote_instance(&session.id, session.generation, Some("original"))?);
-        store.append_remote(&session.id, 1, "assistant", "Must remain a duplicate")?;
+        store.append_remote(&session.id, 1, "assistant", "Must remain a duplicate", None)?;
         assert_eq!(store.snapshot(Some(&session.id), 0)?.entries.len(), 1);
         Ok(())
     }

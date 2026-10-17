@@ -78,7 +78,41 @@ impl Daemon {
             token,
         });
         crate::metadata::start(&daemon);
+        let weak = Arc::downgrade(&daemon);
+        std::thread::spawn(move || {
+            let Some(daemon) = weak.upgrade() else {
+                return;
+            };
+            let workspaces = daemon
+                .store
+                .lock()
+                .expect("store poisoned")
+                .snapshot(None, 0)
+                .map(|snapshot| snapshot.workspaces)
+                .unwrap_or_default();
+            for workspace in workspaces {
+                let _command = daemon.commands.lock().expect("commands poisoned");
+                daemon.discover_workspace_if_git(&workspace.id, &workspace.directory);
+            }
+        });
         Ok(daemon)
+    }
+
+    // Non-Git directories remain valid workspaces; explicit discovery reports errors.
+    fn discover_workspace_if_git(&self, id: &str, directory: &str) {
+        if let Ok(mut trees) = crate::worktrees::discover(id, directory) {
+            let store = self.store.lock().expect("store poisoned");
+            if let Ok(snapshot) = store.snapshot(None, 0) {
+                // Recreating a removed path requires explicit attachment; startup
+                // must not silently revive archived sessions' deleted checkouts.
+                trees.retain(|tree| {
+                    !snapshot.worktrees.iter().any(|old| {
+                        old.workspace_id == id && old.directory == tree.directory && old.removed
+                    })
+                });
+                let _ = store.attach_worktrees(trees);
+            }
+        }
     }
 
     /// Reads a bounded view without transferring engine ownership.
@@ -87,6 +121,15 @@ impl Daemon {
     /// Returns storage errors.
     pub fn snapshot(&self, id: Option<&str>, before: i64) -> Result<Snapshot> {
         self.snapshot_pages(id, before, 0)
+    }
+
+    /// Inspects a registered checkout on this daemon's host without changing it.
+    ///
+    /// # Errors
+    /// Returns unknown-checkout, changed-identity, timeout, or Git errors.
+    pub fn worktree_changes(&self, id: &str) -> Result<crate::model::WorktreeChanges> {
+        let tree = self.store.lock().expect("store poisoned").worktree(id)?;
+        crate::worktrees::changes(&tree)
     }
 
     /// Reads independent transcript and aside pages without changing execution.
@@ -527,11 +570,15 @@ impl Daemon {
                     .context("Engine cannot accept the document yet")?;
                 session_id
             }
-            Command::CreateWorkspace { name, directory } => self
-                .store
-                .lock()
-                .expect("store poisoned")
-                .create_workspace(&name, &directory)?,
+            Command::CreateWorkspace { name, directory } => {
+                let id = self
+                    .store
+                    .lock()
+                    .expect("store poisoned")
+                    .create_workspace(&name, &directory)?;
+                self.discover_workspace_if_git(&id, &directory);
+                id
+            }
             Command::CreateSession {
                 workspace_id,
                 name,
@@ -541,6 +588,71 @@ impl Daemon {
                 &name,
                 backend,
             )?,
+            Command::DiscoverWorktrees {
+                workspace_id,
+                directory,
+            } => {
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .workspace(&workspace_id)?;
+                let trees = crate::worktrees::discover(&workspace_id, &directory)?;
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .attach_worktrees(trees)?;
+                workspace_id
+            }
+            Command::CreateWorktree {
+                source_id,
+                directory,
+                branch,
+                base,
+            } => {
+                let source = self
+                    .store
+                    .lock()
+                    .expect("store poisoned")
+                    .worktree(&source_id)?;
+                let trees = crate::worktrees::create(&source, &directory, &branch, &base)?;
+                let directory = std::fs::canonicalize(&directory)?
+                    .to_string_lossy()
+                    .into_owned();
+                let store = self.store.lock().expect("store poisoned");
+                store.attach_worktrees(trees)?;
+                store
+                    .snapshot(None, 0)?
+                    .worktrees
+                    .into_iter()
+                    .find(|tree| {
+                        tree.workspace_id == source.workspace_id && tree.directory == directory
+                    })
+                    .context("Created worktree was not discovered")?
+                    .id
+            }
+            Command::RemoveWorktree { worktree_id } => {
+                // The command lock serializes creation/removal; release the store while Git runs.
+                let tree = {
+                    let store = self.store.lock().expect("store poisoned");
+                    store.ensure_worktree_removable(&worktree_id)?;
+                    store.worktree(&worktree_id)?
+                };
+                crate::worktrees::remove(&tree)?;
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .forget_worktree(&worktree_id)?;
+                worktree_id
+            }
+            Command::CreateWorktreeSession {
+                worktree_id,
+                name,
+                backend,
+            } => self
+                .store
+                .lock()
+                .expect("store poisoned")
+                .create_worktree_session(&worktree_id, &name, backend)?,
             Command::RenameSession { session_id, name } => {
                 self.store
                     .lock()
@@ -601,6 +713,7 @@ impl Daemon {
                 session_id,
                 request_id,
                 text,
+                images,
             } => {
                 let live_control =
                     crate::livecontrol::LiveControl::parse(&text).filter(|control| {
@@ -682,7 +795,7 @@ impl Daemon {
                     &request_id,
                     &text,
                 )?;
-                if accepted && let Err(error) = self.dispatch(&session_id, text) {
+                if accepted && let Err(error) = self.dispatch(&session_id, text, images) {
                     self.store.lock().expect("store poisoned").set_state(
                         &session_id,
                         RunState::Failed,
@@ -718,8 +831,16 @@ impl Daemon {
         Ok(())
     }
 
-    fn dispatch(self: &Arc<Self>, id: &str, text: String) -> Result<()> {
-        self.dispatch_input(id, workers::Input::Prompt(text))
+    fn dispatch(
+        self: &Arc<Self>,
+        id: &str,
+        text: String,
+        images: Vec<crate::model::PromptImage>,
+    ) -> Result<()> {
+        self.dispatch_input(
+            id,
+            workers::Input::Prompt(crate::workers::PromptInput { text, images }),
+        )
     }
 
     fn dispatch_input(self: &Arc<Self>, id: &str, message: workers::Input) -> Result<()> {
@@ -733,17 +854,21 @@ impl Daemon {
         if !active.contains_key(id) {
             let store = self.store.lock().expect("store poisoned");
             let session = store.session(id)?;
-            let workspace = store.workspace(&session.workspace_id)?;
+            let directory = store.session_directory(&session)?;
+            let checkout = session
+                .worktree_id
+                .as_ref()
+                .map(|id| store.worktree(id))
+                .transpose()?;
+            drop(store);
+            if let Some(checkout) = checkout {
+                crate::worktrees::verify(&checkout)?;
+            }
             let (input, receiver) = mpsc::channel(1);
             let daemon = Arc::clone(self);
             let task = tokio::spawn(async move {
-                if let Err(error) = workers::run(
-                    Arc::clone(&daemon),
-                    &session,
-                    &workspace.directory,
-                    receiver,
-                )
-                .await
+                if let Err(error) =
+                    workers::run(Arc::clone(&daemon), &session, &directory, receiver).await
                 {
                     let store = daemon.store.lock().expect("store poisoned");
                     if store
@@ -806,6 +931,7 @@ mod tests {
             session_id: session.id.clone(),
             request_id: "remote-setting".into(),
             text: "/mc off".into(),
+            images: Vec::new(),
         };
         assert!(daemon.execute(command()).is_err());
         assert!(!daemon.store.lock().unwrap().aside_recorded(
@@ -878,6 +1004,7 @@ mod tests {
             session_id: id.clone(),
             request_id: request.into(),
             text: text.into(),
+            images: Vec::new(),
         };
         // An older engine must not bypass ordinary busy-turn validation.
         assert!(daemon.execute(command("old", "/mc off")).is_err());
@@ -1006,6 +1133,7 @@ mod tests {
             session_id: id.clone(),
             request_id: request.into(),
             text: text.into(),
+            images: Vec::new(),
         };
         // No controller grant is needed: Plank allows observers to ask asides.
         daemon.execute(command("side-1", "/btw Why?"))?;
@@ -1095,10 +1223,30 @@ async fn command(
     Json(command): Json<Command>,
 ) -> std::result::Result<Json<Receipt>, ApiError> {
     authorize(&daemon, &headers)?;
-    daemon
-        .execute(command)
+    tokio::task::spawn_blocking(move || daemon.execute(command))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(Json)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorktreeQuery {
+    id: String,
+}
+
+async fn worktree_changes(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Query(query): Query<WorktreeQuery>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    authorize(&daemon, &headers)?;
+    tokio::task::spawn_blocking(move || daemon.worktree_changes(&query.id))
+        .await
+        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map(|changes| ([("cache-control", "no-store")], Json(changes)))
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -1351,6 +1499,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/command", post(command))
         .route("/v1/editor", get(editor_read).post(editor_upload))
         .route("/v1/export", get(export_file))
+        .route("/v1/worktree-changes", get(worktree_changes))
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024))
         .with_state(daemon)
 }

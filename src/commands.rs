@@ -355,7 +355,7 @@ pub fn matching(query: &str) -> Vec<&'static PlankCommand> {
 /// Finds matching commands in a session's authoritative runtime catalog.
 pub fn matching_in<'a>(commands: &'a [PlankCommand], query: &str) -> Vec<&'a PlankCommand> {
     let query = query.trim().trim_start_matches('/').to_lowercase();
-    commands
+    let mut matches: Vec<_> = commands
         .iter()
         .filter(|command| {
             query.is_empty()
@@ -372,7 +372,19 @@ pub fn matching_in<'a>(commands: &'a [PlankCommand], query: &str) -> Vec<&'a Pla
                         .any(|name| name.to_lowercase().contains(&query))
                 })
         })
-        .collect()
+        .collect();
+    // A typed command name takes precedence over incidental help-text matches.
+    matches.sort_by_key(|command| {
+        let name = command.name.trim_start_matches('/').to_lowercase();
+        if name == query {
+            0
+        } else if name.starts_with(&query) {
+            1
+        } else {
+            2
+        }
+    });
+    matches
 }
 
 #[cfg(test)]
